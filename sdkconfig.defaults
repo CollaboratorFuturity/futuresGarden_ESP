@@ -1,0 +1,66 @@
+# Verbatim copy of Travis's right-side-cluster-esp32s3 screen config,
+# the only known tear-free combo on this Waveshare 2.8C panel:
+#   bounce-buffer mode + vsync-end semaphore + single framebuffer.
+
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEMCPY_MEMSET_STD=y
+CONFIG_LV_USE_USER_DATA=y
+CONFIG_LV_USE_CHART=y
+CONFIG_LV_USE_PERF_MONITOR=y
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE=64
+
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+
+# Travis's screen knobs (set via menuconfig in his repo, captured here):
+CONFIG_EXAMPLE_USE_BOUNCE_BUFFER=y
+CONFIG_EXAMPLE_AVOID_TEAR_EFFECT_WITH_SEM=y
+
+# LVGL refresh + FreeRTOS tick match Travis.
+CONFIG_LV_DISP_DEF_REFR_PERIOD=15
+CONFIG_LV_INDEV_DEF_READ_PERIOD=15
+CONFIG_FREERTOS_HZ=100
+
+# mbedTLS memory: default IDF 5.5 wires SSL buffers (~20 KB) into internal
+# RAM, which OOMs the ElevenLabs TLS handshake once LVGL + audio + WSS task
+# have already eaten internal SRAM. EXTERNAL_MEM_ALLOC routes mbedTLS allocs
+# to PSRAM; DYNAMIC_BUFFER frees the big in/out buffers between handshakes.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_PEER_CERT=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+
+# HW AES accelerator on ESP32-S3 needs ~16 KB of DMA-capable internal SRAM
+# to decrypt each TLS record; ElevenLabs agent audio events blow this every
+# turn ("esp-aes: Failed to allocate memory"). Software AES via mbedTLS has
+# no DMA requirement — small TLS throughput hit, no alloc failures.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+
+# Our UI needs these fonts; Travis's project doesn't.
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_22=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_26=y
+
+# OTA — rollback enables auto-revert if a new image never marks itself valid
+# (we call esp_ota_mark_app_valid_cancel_rollback in convai.c after the WSS
+# connects, which is our "this build works" milestone).
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_APP_ROLLBACK_ENABLE=y
+
+# Bake `git describe` into esp_app_get_description()->version so OTA can
+# compare the running version against the GitHub release tag.
+CONFIG_APP_PROJECT_VER_FROM_GIT_DESCRIBE=y
+
+# Cert bundle — needed because GitHub's release-asset URL (api.github.com)
+# redirects to objects.githubusercontent.com, a different CA chain. Pinning
+# one cert per host would be brittle. Bundle covers both. Co-exists with our
+# pinned roots for ElevenLabs/Supabase — those keep using cert_pem.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y

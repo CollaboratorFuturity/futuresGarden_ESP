@@ -1,0 +1,320 @@
+#include "Wireless.h"
+
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "orb_ui.h"
+#include "config_fetch.h"
+#include "i2s_audio.h"
+#include "log_sink.h"
+#include "secrets.h"
+#include "convai.h"
+#include "ota.h"
+
+uint16_t BLE_NUM = 0;
+uint16_t WIFI_NUM = 0;
+bool Scan_finish = 0;
+
+bool WiFi_Scan_Finish = 0;
+bool BLE_Scan_Finish = 0;
+bool WiFi_Connected = false;
+
+static const char *WIFI_TAG = "orb-wifi";
+
+// Cache of the fetched agent identity, exposed via orb_get_agent_id/name.
+// Populated once by post_connect_task after orb_config_fetch returns.
+static char s_agent_id[64]   = {0};
+static char s_agent_name[64] = {0};
+
+const char *orb_get_agent_id(void)   { return s_agent_id; }
+const char *orb_get_agent_name(void) { return s_agent_name; }
+
+bool orb_refresh_config(void)
+{
+    OrbConfig cfg;
+    if (!orb_config_fetch(&cfg)) {
+        ESP_LOGW(WIFI_TAG, "config refresh failed — keeping cached agent=%s vol=N/A",
+                 s_agent_id);
+        return false;
+    }
+    ESP_LOGI(WIFI_TAG, "config refresh: agent=%s name=%s vol=%d",
+             cfg.agent_id, cfg.agent_name, cfg.volume);
+    strncpy(s_agent_id,   cfg.agent_id,   sizeof(s_agent_id)   - 1);
+    s_agent_id[sizeof(s_agent_id)     - 1] = '\0';
+    strncpy(s_agent_name, cfg.agent_name, sizeof(s_agent_name) - 1);
+    s_agent_name[sizeof(s_agent_name) - 1] = '\0';
+    orb_ui_set_agent_name(cfg.agent_name);
+    if (cfg.volume > 0) i2s_audio_set_volume_pct(cfg.volume * 10);
+    return true;
+}
+
+static void post_connect_task(void *arg)
+{
+    orb_ui_set_state(ORB_CONFIG);
+
+    orb_sntp_sync(15000);
+
+    if (orb_refresh_config()) {
+        // Stand up the UDP log sink before the conversation kicks off so
+        // every WSS / convai event is visible.
+        log_sink_start(6666);
+
+        // OTA check: runs here, before Convai allocates its PSRAM buffers
+        // and fragments internal SRAM. On a successful update this calls
+        // esp_restart() and never returns; on "no update" or failure it
+        // returns and boot continues into the conversation.
+        orb_ota_check_and_update_on_boot();
+
+        // Auto-start the conversation. No idle SPLASH state any more —
+        // the device goes straight from CONFIG to LOADING → agent greeting.
+        // NFC scans still restart the session (see nfc.c::handle_uid).
+        orb_ui_set_state(ORB_LOADING);
+        convai_start(s_agent_id);
+    } else {
+        ESP_LOGE(WIFI_TAG, "config fetch failed");
+        // Stay in ORB_CONFIG so the screen reflects that we got the network
+        // but never resolved an agent. Manual NFC scan will retry config
+        // fetch + convai_start.
+    }
+    vTaskDelete(NULL);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        orb_ui_set_state(ORB_WIFI);
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        WiFi_Connected = false;
+        orb_ui_set_state(ORB_WIFI);
+        wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)data;
+        // reason codes: 201=NO_AP_FOUND (wrong SSID / 5GHz-only), 202=AUTH_FAIL
+        // (wrong password), 15=4WAY_HANDSHAKE_TIMEOUT (also usually wrong PW),
+        // 204=HANDSHAKE_TIMEOUT, 200=AUTH_EXPIRE.
+        ESP_LOGW(WIFI_TAG, "disconnected reason=%d, retrying", ev ? ev->reason : -1);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        ESP_LOGI(WIFI_TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
+        WiFi_Connected = true;
+        // CONFIG state is set inside post_connect_task, AFTER the WIFI→
+        // CONFIG transition beep. UI stays on ORB_WIFI until then.
+        xTaskCreatePinnedToCore(post_connect_task, "orb_postcon", 6144, NULL, 4, NULL, 0);
+    }
+}
+
+void Wireless_Init(void)
+{
+    // Initialize NVS.
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK( ret );
+    // WiFi
+    xTaskCreatePinnedToCore(
+        WIFI_Init,
+        "WIFI task",
+        4096,
+        NULL,
+        2,
+        NULL,
+        0);
+    // BLE — preserved but NOT auto-started. Starting BLE_Init at boot lets
+    // the BLE scan steal the radio from WiFi association via the coex
+    // arbiter ("Coexist: Wi-Fi connect fail"). When BLE features come
+    // online, spawn this task explicitly from wherever needs it AFTER the
+    // WiFi connection is stable.
+    //
+    // xTaskCreatePinnedToCore(BLE_Init, "BLE task", 4096, NULL, 2, NULL, 0);
+}
+
+void WIFI_Init(void *arg)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+
+    wifi_config_t wcfg = {0};
+    strncpy((char *)wcfg.sta.ssid, WIFI_SSID, sizeof(wcfg.sta.ssid) - 1);
+    strncpy((char *)wcfg.sta.password, WIFI_PASSWORD, sizeof(wcfg.sta.password) - 1);
+    // Accept anything from open to WPA3 — WPA3-only routers (Eero 6+, modern
+    // ASUS/Netgear) reject the stricter WIFI_AUTH_WPA2_PSK threshold.
+    wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    wcfg.sta.pmf_cfg.capable  = true;
+    wcfg.sta.pmf_cfg.required = false;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    vTaskDelete(NULL);
+}
+
+uint16_t WIFI_Scan(void)
+{
+    uint16_t ap_count = 0;
+    esp_wifi_scan_start(NULL, true);
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+    WiFi_Scan_Finish = 1;
+    if (BLE_Scan_Finish == 1)
+        Scan_finish = 1;
+    return ap_count;
+}
+
+
+#define GATTC_TAG "GATTC_TAG"
+#define SCAN_DURATION 20  
+#define MAX_DISCOVERED_DEVICES 100 
+
+typedef struct {
+    uint8_t address[6];
+    bool is_valid;
+} discovered_device_t;
+
+static discovered_device_t discovered_devices[MAX_DISCOVERED_DEVICES];
+static size_t num_discovered_devices = 0;
+static size_t num_devices_with_name = 0;
+
+
+static bool is_device_discovered(const uint8_t *addr) {
+    for (size_t i = 0; i < num_discovered_devices; i++) {
+        if (memcmp(discovered_devices[i].address, addr, 6) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+static void add_device_to_list(const uint8_t *addr) {
+    if (num_discovered_devices < MAX_DISCOVERED_DEVICES) {
+        memcpy(discovered_devices[num_discovered_devices].address, addr, 6);
+        discovered_devices[num_discovered_devices].is_valid = true;
+        num_discovered_devices++;
+    }
+}
+
+static bool extract_device_name(const uint8_t *adv_data, uint8_t adv_data_len, char *device_name, size_t max_name_len) {
+    size_t offset = 0;
+    while (offset < adv_data_len) {
+        if (adv_data[offset] == 0) break;
+
+        uint8_t length = adv_data[offset];
+        if (length == 0 || offset + length > adv_data_len) break; 
+
+        uint8_t type = adv_data[offset + 1];
+        if (type == ESP_BLE_AD_TYPE_NAME_CMPL || type == ESP_BLE_AD_TYPE_NAME_SHORT) {
+            if (length > 1 && length - 1 < max_name_len) {
+                memcpy(device_name, &adv_data[offset + 2], length - 1);
+                device_name[length - 1] = '\0'; 
+                return true;
+            } else {
+                return false;
+            }
+        }
+        offset += length + 1;
+    }
+    return false;
+}
+
+static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    static char device_name[100];
+
+    switch (event) {
+        case ESP_GAP_BLE_SCAN_RESULT_EVT:
+            if (param->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT) {
+                if (!is_device_discovered(param->scan_rst.bda)) {
+                    add_device_to_list(param->scan_rst.bda);
+                    BLE_NUM++; 
+
+                    if (extract_device_name(param->scan_rst.ble_adv, param->scan_rst.adv_data_len, device_name, sizeof(device_name))) {
+                        num_devices_with_name++;
+                        // printf("Found device: %02X:%02X:%02X:%02X:%02X:%02X\n        Name: %s\n        RSSI: %d\r\n",
+                        //          param->scan_rst.bda[0], param->scan_rst.bda[1],
+                        //          param->scan_rst.bda[2], param->scan_rst.bda[3],
+                        //          param->scan_rst.bda[4], param->scan_rst.bda[5],
+                        //          device_name, param->scan_rst.rssi);
+                        // printf("\r\n");
+                    } else {
+                        // printf("Found device: %02X:%02X:%02X:%02X:%02X:%02X\n        Name: Unknown\n        RSSI: %d\r\n",
+                        //          param->scan_rst.bda[0], param->scan_rst.bda[1],
+                        //          param->scan_rst.bda[2], param->scan_rst.bda[3],
+                        //          param->scan_rst.bda[4], param->scan_rst.bda[5],
+                        //          param->scan_rst.rssi);
+                        // printf("\r\n");
+                    }
+                }
+            }
+            break;
+        case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+            ESP_LOGI(GATTC_TAG, "Scan complete. Total devices found: %d (with names: %d)", BLE_NUM, num_devices_with_name);
+            break;
+        default:
+            break;
+    }
+}
+
+void BLE_Init(void *arg)
+{
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t ret = esp_bt_controller_init(&bt_cfg);                                            
+    if (ret) {
+        printf("%s initialize controller failed: %s\n", __func__, esp_err_to_name(ret));        
+        return;}
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);                                           
+    if (ret) {
+        printf("%s enable controller failed: %s\n", __func__, esp_err_to_name(ret));            
+        return;}
+    ret = esp_bluedroid_init();                                                                 
+    if (ret) {
+        printf("%s init bluetooth failed: %s\n", __func__, esp_err_to_name(ret));               
+        return;}
+    ret = esp_bluedroid_enable();                                                               
+    if (ret) {
+        printf("%s enable bluetooth failed: %s\n", __func__, esp_err_to_name(ret));             
+        return;}
+
+    //register the  callback function to the gap module
+    ret = esp_ble_gap_register_callback(esp_gap_cb);                                            
+    if (ret){
+        printf("%s gap register error, error code = %x\n", __func__, ret);                      
+        return;
+    }
+    BLE_Scan();
+    vTaskDelete(NULL);
+
+}
+uint16_t BLE_Scan(void)
+{
+    esp_ble_scan_params_t scan_params = {
+        .scan_type = BLE_SCAN_TYPE_ACTIVE,
+        .own_addr_type = BLE_ADDR_TYPE_RPA_PUBLIC,
+        .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+        .scan_interval = 0x50,   
+        .scan_window = 0x30,       
+        .scan_duplicate         = BLE_SCAN_DUPLICATE_DISABLE
+    };
+    ESP_ERROR_CHECK(esp_ble_gap_set_scan_params(&scan_params));
+
+    printf("Starting BLE scan...\n");
+    ESP_ERROR_CHECK(esp_ble_gap_start_scanning(SCAN_DURATION));
+    
+    // Set scanning duration
+    vTaskDelay(SCAN_DURATION * 1000 / portTICK_PERIOD_MS);
+    
+    printf("Stopping BLE scan...\n");
+    ESP_ERROR_CHECK(esp_ble_gap_stop_scanning());
+    BLE_Scan_Finish = 1;
+    if(WiFi_Scan_Finish == 1)
+        Scan_finish = 1;
+    return BLE_NUM;
+}

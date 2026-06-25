@@ -1,0 +1,6 @@
+{
+  "idf.flashType": "UART",
+  "idf.port": "/dev/tty.usbmodem1101",
+  "idf.currentSetup": "/Users/lynch/.espressif/v5.5/esp-idf",
+  "idf.customExtraVars": {}
+}

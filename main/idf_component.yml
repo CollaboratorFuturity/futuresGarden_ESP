@@ -1,0 +1,9 @@
+## LOCKED VERSIONS — DO NOT CHANGE.
+## ESP-IDF 5.5.0 + LVGL 8.4.0 is the only known tear-free combo on this
+## panel. See SCREEN.md and CLAUDE.md ("LVGL + RGB panel" section). If you
+## think you have a reason to bump either of these, you don't.
+dependencies:
+  idf: "==5.5.0"
+  lvgl/lvgl: "==8.4.0"
+  espressif/cjson: "^1.7.18"
+  espressif/esp_websocket_client: "1.4.0"
