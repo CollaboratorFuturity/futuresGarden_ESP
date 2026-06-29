@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -9,12 +10,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
+#include "cJSON.h"
 
 #include "I2C_Driver.h"
 #include "orb_ui.h"
 #include "i2s_audio.h"
 #include "convai.h"
 #include "Wireless.h"
+#include "config_fetch.h"
 
 #define PN532_ADDR        0x24
 #define PN532_FREQ_HZ     400000   // PN532 datasheet supports up to 400 kHz I2C
@@ -41,6 +44,12 @@ static volatile bool s_polling_enabled = true;
 static uint8_t s_last_uid[10];
 static int s_last_uid_len = 0;
 static int64_t s_last_seen_us = 0;
+
+// Downloaded UID->phrase map (BEHAVIOR.md §6). Owned exclusively by nfc_task —
+// warmed once before the poll loop and reloaded on each AGENT_START/TEST scan —
+// so it needs no lock. NULL until the first successful download; while NULL,
+// every tag reads as "unmapped" and does nothing.
+static cJSON *s_tags = NULL;
 
 
 // ─── Low-level frame helpers ─────────────────────────────────────────────
@@ -196,11 +205,35 @@ static int pn532_read_passive_target(uint8_t *uid, int max_uid)
 
 // ─── Tag handling ─────────────────────────────────────────────────────────
 
+// Format the UID as colon-separated uppercase hex (e.g. "04:38:17:9A:CB:2A:81")
+// to match the key format in nfc_tags.json. A 7-byte UID is 20 chars + NUL.
 static void uid_to_hex(const uint8_t *uid, int len, char *out, int out_len)
 {
     int idx = 0;
-    for (int i = 0; i < len && idx + 3 < out_len; i++) {
+    for (int i = 0; i < len; i++) {
+        int need = (i > 0 ? 1 : 0) + 2;        // optional ':' + two hex digits
+        if (idx + need + 1 > out_len) break;   // +1 leaves room for the NUL
+        if (i > 0) out[idx++] = ':';
         idx += snprintf(&out[idx], out_len - idx, "%02X", uid[i]);
+    }
+    out[idx] = '\0';
+}
+
+// Download the tag table from GitHub and swap it in on success. On failure the
+// previous table (if any) is kept, so a transient network blip doesn't wipe it.
+// Called only from nfc_task (single-threaded owner of s_tags).
+static void nfc_tags_reload(void)
+{
+    char *dl = orb_nfc_tags_fetch();
+    cJSON *t = dl ? cJSON_Parse(dl) : NULL;
+    free(dl);
+    if (t) {
+        if (s_tags) cJSON_Delete(s_tags);
+        s_tags = t;
+        ESP_LOGI(PN532_TAG, "nfc tags: downloaded, %d entries", cJSON_GetArraySize(t));
+    } else {
+        ESP_LOGW(PN532_TAG, "nfc tags reload failed — keeping %s",
+                 s_tags ? "last table" : "no table (all tags unmapped)");
     }
 }
 
@@ -221,14 +254,23 @@ static void handle_uid(const uint8_t *uid, int len)
     uid_to_hex(uid, len, hex, sizeof(hex));
     ESP_LOGI(PN532_TAG, "tag UID=%s (%d bytes)", hex, len);
 
-    // Scan acknowledgement: show ORB_NFC first so the screen is already on the
-    // purple "NFC Scanned" state while the blopp plays. It stays up through the
-    // config fetch; the next real state (ORB_LOADING before convai_start, then
-    // the Convai tasks' USER_TALK / AGENT / MUTED) replaces it naturally.
-    orb_ui_set_state(ORB_NFC);
+    // Make sure we have a table before we decide anything. If the boot warm-up
+    // failed (e.g. network came up late), this is the lazy retry — the first
+    // scan pulls the table, then looks itself up against it.
+    if (!s_tags) nfc_tags_reload();
 
-    // Pre-Convai cue: three-tone "blopp" so the user hears that the tag was
-    // registered before the agent starts talking.
+    // Look up the tag BEFORE any UI/tone so an unmapped card is a true no-op
+    // (BEHAVIOR.md §6 — "Unmapped UID, any state: Ignore").
+    const cJSON *entry = s_tags ? cJSON_GetObjectItemCaseSensitive(s_tags, hex) : NULL;
+    if (!cJSON_IsString(entry) || !entry->valuestring || !entry->valuestring[0]) {
+        ESP_LOGI(PN532_TAG, "unmapped UID %s — ignoring", hex);
+        return;
+    }
+    const char *phrase = entry->valuestring;
+
+    // Mapped card — acknowledge: show ORB_NFC first so the purple "NFC Scanned"
+    // screen is already up while the three-tone "blopp" cue plays.
+    orb_ui_set_state(ORB_NFC);
     static const i2s_audio_tone_t kTagBlopp[] = {
         { 250, 80 },
         { 290, 80 },
@@ -236,20 +278,40 @@ static void handle_uid(const uint8_t *uid, int len)
     };
     i2s_audio_tone_sequence(kTagBlopp, sizeof(kTagBlopp) / sizeof(kTagBlopp[0]));
 
-    // Test-mode: any tag starts a conversation with the agent fetched at
-    // boot. Whitelist comes later (stage 5). If the conversation is already
-    // Re-scanning the tag while a conversation is running restarts it.
-    // (Stage 5 will replace this with the real tag table — AGENT_START vs
-    // TEST vs custom phrase per BEHAVIOR.md §6.)
+    bool reserved = (strcmp(phrase, "AGENT_START") == 0) ||
+                    (strcmp(phrase, "TEST") == 0);
+
+    // Custom phrase into a LIVE session: inject it as a user turn and let the
+    // agent respond — no teardown, no restart, no config fetch. This is the
+    // whole point of the tag table (BEHAVIOR.md §6.2).
+    if (!reserved && convai_is_running()) {
+        ESP_LOGI(PN532_TAG, "custom phrase -> inject into live session: \"%s\"", phrase);
+        orb_ui_set_state(ORB_LOADING);   // waiting for the agent's reply
+        convai_send_user_message(phrase);
+        return;
+    }
+
+    // Otherwise we (re)start a session: reserved AGENT_START/TEST tags (no
+    // splash/temp-WSS state in this firmware, so both mean "reload + restart"),
+    // or a custom-phrase tag scanned while nothing is running (rare — the orb is
+    // normally always-on; the phrase is dropped, session restarts so it stays
+    // usable).
+    if (reserved) {
+        ESP_LOGI(PN532_TAG, "reserved tag '%s' — reload + restart session", phrase);
+    } else {
+        ESP_LOGW(PN532_TAG, "custom phrase but convai not running — restarting (phrase dropped)");
+    }
+
+    // Reload the tag table too, so an edited table on GitHub lands on the next
+    // scan without a reboot.
+    nfc_tags_reload();
+
     if (convai_is_running()) {
-        ESP_LOGI(PN532_TAG, "tag re-scan during running_agent — restarting conversation");
         convai_stop();
         vTaskDelay(pdMS_TO_TICKS(200));   // let teardown settle (ORB_NFC stays up)
     }
-    // Refresh config before each start so agent / volume changes from
-    // Supabase land without a reboot. Failure is non-fatal — we keep the
-    // cached values from the previous fetch. ORB_NFC remains on screen for
-    // the duration of this TLS HTTPS GET.
+    // Refresh config before each start so agent / volume changes from Supabase
+    // land without a reboot. Failure is non-fatal — keep cached values.
     orb_refresh_config();
     const char *agent = orb_get_agent_id();
     if (!agent || !agent[0]) {
@@ -304,6 +366,11 @@ static void nfc_task(void *arg)
         up = pn532_bringup();
     }
     ESP_LOGI(PN532_TAG, "PN532 ready, polling every %d ms", POLL_PERIOD_MS);
+
+    // Warm the tag table once before polling so the first scan has no download
+    // latency. Best-effort — if the network isn't up yet this fails and the
+    // first scan's lazy reload (in handle_uid) covers it.
+    nfc_tags_reload();
 
     // Heartbeat: every ~10 s, log a summary so the UDP sink shows the task
     // is alive and how often pn532_read_passive_target is failing vs

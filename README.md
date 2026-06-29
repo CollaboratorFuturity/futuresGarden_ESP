@@ -89,14 +89,20 @@ app_main:
   NFC_Init              # spawns PN532 polling task (core 0)
   button_init           # GPIO 0 ISR + 6 KB debounce task
   i2s_audio_init        # *** USB DIES HERE ***
-  Wireless_Init         # spawns WiFi task → event handler drives BOOT→WIFI→CONFIG→SPLASH
+  Wireless_Init         # spawns WiFi task → event handler drives BOOT→WIFI→CONFIG→LOADING
 
-WIFI_EVENT_STA_GOT_IP fires post_connect_task:
-  orb_sntp_sync(15s)
+WIFI_EVENT_STA_GOT_IP fires post_connect_task (8 KB stack):
+  log_sink_start(6666)  # UDP sink FIRST — USB-CDC already dead, so a crash in any
+                        #   later step is still visible over UDP
+  orb_sntp_sync(15s)    # clock must be right before any TLS cert validation
+  orb_ota_check_and_update_on_boot()   # OTA recovery floor — BEFORE config + convai
+                        #   (on a successful update this restarts and never returns)
+  orb_ui_set_state(ORB_CONFIG)
   orb_refresh_config()  # GET https://…/get-device-config → agent_id, agent_name, volume
-  i2s_audio_set_volume_pct(cfg.volume * 10)
-  orb_ui_set_state(ORB_SPLASH)
-  log_sink_start(6666)  # UDP logs over WiFi from here on
+                        #   (applies i2s_audio_set_volume_pct(cfg.volume * 10) internally)
+  orb_ui_set_state(ORB_LOADING)
+  convai_start(agent_id)  # WSS opens → greeting plays. No idle SPLASH — the device
+                        #   boots straight into a persistent conversation.
 
 On NFC tag scan (any tag, for now):
   orb_ui_set_state(ORB_NFC)                                  # purple "NFC Scanned" — shown before the blopp
@@ -271,7 +277,7 @@ See [PROGRESS.md](PROGRESS.md) for the full Convai module description. Quick sum
 | Power-rail wait after press accepted | 150 ms |
 | Silent-revert threshold | press < 1000 ms |
 | Frame | 30 ms / 480 samples / 960 bytes |
-| Tail silence pad | 27 frames = 810 ms (spec is 1500 ms — shortened by project decision) |
+| Tail silence pad | 43 frames ≈ 1290 ms (spec is 1500 ms — shortened by project decision; must exceed the server VAD threshold pinned to 800 ms) |
 | Short-turn skip (real audio) | < 800 ms |
 
 ---

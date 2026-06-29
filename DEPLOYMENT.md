@@ -32,7 +32,7 @@ Run these checks. If anything fails, surface the failure to the user and
 STOP — do not try to "fix" it without asking.
 
 ```bash
-cd /Users/lynch/Documents/Futurity/futuresGarden_ESP32/LVGLastest_ESP-IDF
+cd /Users/lynch/Documents/Futurity/futuresGarden_ESP32
 
 # 1. Are we in a git repo?
 git rev-parse --is-inside-work-tree
@@ -88,7 +88,7 @@ main/secrets.h."
 On yes:
 
 ```bash
-cd /Users/lynch/Documents/Futurity/futuresGarden_ESP32/LVGLastest_ESP-IDF
+cd /Users/lynch/Documents/Futurity/futuresGarden_ESP32
 
 # Make sure secrets.h is NOT going to be committed — the file holds WiFi
 # passwords and ElevenLabs key. Verify it's ignored before the first commit.
@@ -174,7 +174,7 @@ DO NOT proceed past this gate without an affirmative answer.
 After confirmation:
 
 ```bash
-cd /Users/lynch/Documents/Futurity/futuresGarden_ESP32/LVGLastest_ESP-IDF
+cd /Users/lynch/Documents/Futurity/futuresGarden_ESP32
 NEXT="<the version from Phase 2>"
 
 # 1. Tag the current commit.

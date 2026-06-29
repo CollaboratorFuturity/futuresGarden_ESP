@@ -1,10 +1,10 @@
 # The Orb — ESP32-S3 build progress
 
-Working base: this folder (`ESP32-S3-Touch-LCD-2.8C-Test`). Board, display, LVGL 9, WiFi,
-I2C, NFC, I2S audio, and ElevenLabs ConvAI WebSocket all confirmed working end-to-end.
-Push-to-talk conversation with the agent works. Volume + agent are hot-reloaded from
-Supabase on every tag scan.
-e
+Working base: this repo (`futuresGarden_ESP32`, IDF project name `ESP32-S3-Touch-LCD-2.8C-Test`).
+Board, display (LVGL **8.4** — see the migration note at the bottom; an earlier LVGL 9 attempt
+was reverted), WiFi, I2C, NFC, I2S audio, boot-time GitHub OTA, and the ElevenLabs ConvAI
+WebSocket all confirmed working end-to-end. Push-to-talk conversation with the agent works.
+Volume + agent are hot-reloaded from Supabase on every tag scan.
 ---
 
 ## Phase 0 — Clean up the example ✅
@@ -19,15 +19,19 @@ e
 
 ## Phase 1 — Orb UI ✅
 
-LVGL 9 via `esp_lvgl_port` (migrated from LVGL 8.2 — see "LVGL 9 migration notes" below).
-RGB panel scan-out drift fixed with `CONFIG_LCD_RGB_RESTART_IN_VSYNC=y`.
+LVGL **8.4**, display driver registered **directly** (no `esp_lvgl_port`). Tear-free via
+Travis's bounce-buffer + vsync-semaphore + single-FB config — see [SCREEN.md](SCREEN.md).
+(An LVGL 9 + `esp_lvgl_port` build was tried and reverted; the stale notes are at the bottom
+of this file, kept only for history. `CONFIG_LCD_RGB_RESTART_IN_VSYNC` is **not** used.)
 
-**States**: BOOT → WIFI → CONFIG → SPLASH → (LOADING / USER_TALK / AGENT / MUTED / LOW_BAT)
+**States**: BOOT → WIFI → CONFIG → (LOADING / USER_TALK / AGENT / MUTED). Plus
+CHECK_UPD / UPDATING (OTA), WIFI_FAIL, NFC, ERROR, LOW_BAT, and a defined-but-unused
+SPLASH. Full table with colours/labels/motion is authoritative in [README.md](README.md).
 
-**Layout** (480×480 round, inscribed circle, centre = 240,240):
-- y=90: agent name label — Montserrat 20
-- y=240: 200 px filled circle — colour + label change per state
-- y=390: battery voltage label — Montserrat 16
+**Layout** (480×480 round, centre = 240,240): agent name + state label both live **inside**
+the central circle (name Montserrat 24 at y-offset −22, state label Montserrat 26 at +18);
+the battery readout sits at **TOP_MID** (Montserrat 20). The earlier bottom-anchored layout
+(agent name y=90, battery y=390) is gone.
 
 **State colours / labels** (in `main/LVGL_UI/orb_ui.c::STATE_STYLE`):
 
@@ -35,12 +39,17 @@ RGB panel scan-out drift fixed with `CONFIG_LCD_RGB_RESTART_IN_VSYNC=y`.
 |---|---|---|
 | `ORB_BOOT` | `#404040` | "Booting" |
 | `ORB_WIFI` | `#404040` | "Connecting WiFi" |
-| `ORB_CONFIG` | `#404040` | "Config" |
-| `ORB_SPLASH` | `#2A2A2A` | "Ready" |
-| `ORB_LOADING` | `#C47A0C` amber | "..." |
+| `ORB_CONFIG` | `#404040` | "Fetching config" |
+| `ORB_CHECK_UPD` | `#404040` | "Checking for updates" |
+| `ORB_UPDATING` | `#404040` | "Updating" |
+| `ORB_WIFI_FAIL` | `#C0392B` red | "No WiFi. Check router & restart" |
+| `ORB_SPLASH` | `#2A2A2A` | "Ready" (defined, never set at runtime) |
+| `ORB_LOADING` | `#C47A0C` amber | "Loading" |
 | `ORB_USER_TALK` | `#27AE60` green | "Listening" |
-| `ORB_AGENT` | `#1A7DC4` blue | "Speaking" |
-| `ORB_MUTED` | `#2A2A2A` | "Muted" |
+| `ORB_AGENT` | `#1A7DC4` blue | "Agent speaking" |
+| `ORB_MUTED` | `#2A2A2A` | "Press to talk" |
+| `ORB_NFC` | `#7B2FA8` purple | "NFC Scanned" |
+| `ORB_ERROR` | `#C0392B` red | "ERROR Restart the Orb." |
 | `ORB_LOW_BAT` | `#C0392B` red | "Low battery" |
 
 **Threading rule:** state setters write atomics; a 50 ms `lv_timer_create()` callback
@@ -83,7 +92,7 @@ then `convai_start()` drives the rest.
 - [x] **`agent_response` / `user_transcript`** logged
 - [x] **Persistent WSS across many user turns** — opens once on tag scan, stays open until `convai_stop` (re-scan triggers stop + restart)
 - [x] **PTT** — see Phase 4
-- [x] **WSS stack**: bumped `task_stack` to 8192 (default 4 KB overflows cJSON + mbedTLS + decode chunk)
+- [x] **WSS stack**: `task_stack = 6144` (default 4 KB overflows cJSON + mbedTLS + decode chunk; was 8192 but internal-heap fragmentation by the time `convai_start` runs means the largest contiguous block is ~7.5 KB, so 8 KB fails to allocate — see CLAUDE.md / CONVAI.md)
 
 ### NFC integration (test mode)
 
@@ -187,7 +196,7 @@ download mode. Don't hold it during reset.
 | `PTT_POWER_RAIL_WAIT_MS` | 150 ms | spec §3.3 step 2 |
 | `PTT_PRESS_MIN_MS` | 1000 ms (silent-revert threshold) | spec §3.4 |
 | Frame | 30 ms / 480 samples / 960 bytes | spec §3.1 |
-| `PTT_TAIL_SILENCE_FRAMES` | 27 (≈ 810 ms pad) | **project decision** — spec is 50 (1500 ms), we shortened it |
+| `PTT_TAIL_SILENCE_FRAMES` | 43 (≈ 1290 ms pad) | **project decision** — spec is 50 (1500 ms); 43 keeps ~490 ms margin over the server VAD threshold (`silence_duration_ms=800`). An earlier 27 (810 ms) sat on the threshold and merged consecutive presses — see CLAUDE.md. |
 | `PTT_SHORT_TURN_MIN_MS` | 800 ms | spec §2.4 |
 
 ### Behavior (in `main/Convai/convai.c::mic_task`)
@@ -197,30 +206,44 @@ download mode. Don't hold it during reset.
 3. **Release**:
    - **`press_duration < 1000 ms`** → silent revert. No pad. No turn end. Back to `ORB_MUTED`.
    - **`real_audio_ms < 800 ms`** (press ≥ 1000 ms but only N frames actually streamed — RX hiccup) → short-turn skip. Same outcome.
-   - **Otherwise**: `ORB_LOADING` (yellow), send 27 × 30 ms silence frames so server VAD trips end-of-utterance, then idle.
+   - **Otherwise**: `ORB_LOADING` (yellow), send 43 × 30 ms silence frames so server VAD trips end-of-utterance, then idle.
 
-After the agent responds (playback_task drains audio and sees 250 ms of silence) the
-orb returns to `ORB_MUTED`, ready for the next PTT.
+After the agent responds, `playback_task` returns the orb to `ORB_MUTED` when the PCM ring
+drains **and** the `agent_response` end-of-turn signal has been received (a 10 s no-audio
+safety fallback covers a server that vanishes mid-turn). See [CONVAI.md](CONVAI.md) →
+"End-of-turn detection".
 
 ### Keepalive
 
-Just `ping → pong` per ElevenLabs docs and Python SDK source. No periodic
-`user_activity` (that's an app-triggered "user is here" hint, not a timer).
-`inactivity_timeout=120` URL parameter extends server-side cutoff from the 20 s default.
+Two mechanisms (both ported from the legacy Pi):
+
+- **`ping → pong`** on every server ping, with matching `event_id` — sent inline, but
+  **skipped while PTT is held** (mic frames own the WS lock; a contended pong would
+  50 ms-timeout). Skipped pongs are counted and resume on release.
+- **Periodic `user_activity` every 60 s** while the WS is up and PTT is idle — proactive
+  keepalive so the server's ping cadence can't drift past our cutoff.
+
+`inactivity_timeout=120` URL parameter extends the server-side "no client traffic" cutoff.
+See [CONVAI.md](CONVAI.md) for the full pong-skip and keepalive rationale.
 
 ---
 
-## LVGL 9 migration notes
+## LVGL 9 migration notes — ⚠️ SUPERSEDED / REVERTED
 
-Migrated from LVGL 8.2 → 9.x via `esp_lvgl_port` (Espressif's wrapper). Notes for
-future maintenance:
+> **Do not follow this section.** The LVGL 9 + `esp_lvgl_port` migration described below
+> was **tried and reverted** — it tore on this panel in every config combination. The
+> shipping stack is **LVGL 8.4 with the display driver registered directly** (no
+> `esp_lvgl_port`), per [SCREEN.md](SCREEN.md), which is the source of truth. Both
+> `CONFIG_EXAMPLE_DOUBLE_FB` and `CONFIG_LCD_RGB_RESTART_IN_VSYNC` are **off**. The notes
+> are kept only as a record of what not to retry.
 
-- **Use `esp_lvgl_port`**, not raw `lv_display_create` — it handles the RGB-panel tearing avoidance + DMA framebuffer pickup correctly.
-- **RGB panel needs `num_fbs = 2`** (`CONFIG_EXAMPLE_DOUBLE_FB=y`) when `avoid_tearing = true`.
-- **`direct_mode = true`** in `lvgl_port_display_cfg_t.flags` — without it the port falls through to PARTIAL render mode with two full FBs, which leaves stale strips.
-- **`CONFIG_LCD_RGB_RESTART_IN_VSYNC=y`** prevents permanent horizontal-shift drift on reset (documented ESP-IDF gotcha).
-- v9 renames: `lv_scr_act` → `lv_screen_active`, `lv_obj_clear_flag` → `lv_obj_remove_flag`. `LV_FONT_MONTSERRAT_*`, `LV_PART_MAIN`, `lv_color_hex` are unchanged.
-- **`lv_obj_remove_style_all(scr)`** is required on the active screen — v9 default theme adds padding that throws off `LV_ALIGN_*`.
+The reverted v9 attempt used `esp_lvgl_port` with `num_fbs = 2`
+(`CONFIG_EXAMPLE_DOUBLE_FB=y`), `direct_mode = true`, and
+`CONFIG_LCD_RGB_RESTART_IN_VSYNC=y`. v8↔v9 API differences that mattered:
+`lv_scr_act` ↔ `lv_screen_active`, `lv_obj_clear_flag` ↔ `lv_obj_remove_flag`
+(the shipping 8.4 code uses the `lv_scr_act` / `lv_obj_clear_flag` forms), and
+`lv_obj_remove_style_all(scr)` is still required either way to defeat default theme
+padding. See the failed-approaches table in [SCREEN.md](SCREEN.md).
 
 ---
 
@@ -253,12 +276,14 @@ hardcoded to `192.168.1.27`).
 | Phase | Status |
 |---|---|
 | Phase 0 — example cleanup | ✅ done |
-| Phase 1 — Orb UI / LVGL 9 / state machine | ✅ done |
+| Phase 1 — Orb UI / LVGL 8.4 / state machine | ✅ done |
 | Phase 2 — WiFi + SNTP + Supabase config | ✅ done |
 | Phase 2b — ElevenLabs WSS + persistent session | ✅ done (init JSON shape pending) |
+| Phase 2c — App-level send queue (1 MB PSRAM + sender_task) | ✅ done — see [CONVAI.md](CONVAI.md) |
 | Phase 3 — NFC PN532 | ✅ done (tag table pending) |
 | Phase 4 — I2S audio (TX + RX) | ✅ done |
 | Phase 5 — PTT | ✅ done |
+| Phase 5b — Boot-time GitHub OTA + rollback safety | ✅ done — see [DEPLOYMENT.md](DEPLOYMENT.md) / `main/OTA/ota.c` |
 | Phase 6 — NFC tag table (AGENT_START / TEST / custom phrase) | not started |
 | Phase 7 — Battery monitoring per BEHAVIOR.md §9 | partial — GPIO4 ADC + 2 s moving average + load-anchored % gauge wired; idle-gating N/A (no idle state); current-sense N/A (no INA219). See [BATTERY.md](BATTERY.md). Remaining: real brown-out `EMPTY` anchor, harness-resistance fix |
 | Phase 8 — Telemetry POST | not started |
@@ -268,11 +293,11 @@ hardcoded to `192.168.1.27`).
 
 ## What's proven end-to-end
 
-- Boot → WiFi → SNTP → Supabase config → SPLASH
-- Tag scan → WSS open → agent greeting (Zane) plays through speaker
+- Boot → WiFi → SNTP → OTA check → Supabase config → LOADING → agent greeting (auto-start, no idle SPLASH)
+- Tag scan → re-fetch config → WSS open → agent greeting plays through speaker
 - Hold button → mic streams 30 ms PCM chunks to server
 - Release → silence pad → agent transcribes + responds → response plays
 - Loop for many turns within the same WSS
 - Re-scan tag → fresh config fetch (volume / agent change applies live) → restart conversation
-- LCD state transitions match what's happening (BOOT / WIFI / CONFIG / SPLASH / LOADING / USER_TALK / AGENT / MUTED)
+- LCD state transitions match what's happening (BOOT / WIFI / CONFIG / LOADING / USER_TALK / AGENT / MUTED; OTA shows CHECK_UPD / UPDATING)
 - UDP logs survive bursts; on-screen state survives WiFi blips

@@ -42,15 +42,32 @@ load-bearing ones — anything more nuanced is in CONVAI.md.
   - `sender_task` (pinned core 0, prio 5) pops one item at a time, sends it, retries the same item on failure with **500 ms backoff**. Never drops a frame.
   - **Producer never drops either** — `xRingbufferSend(..., portMAX_DELAY)` on queue-full. `mic_task` will block on enqueue if the link is genuinely down; mic capture pauses, no audio is lost. Counted in `s_queue_block_count`.
   - Direct sends (kept bypassing the queue): pong, `user_activity`, `send_initiation`. They're rare or one-shot — too infrequent to drive fail-fast.
-- **Sender stack lives in PSRAM** via `xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM)`. The internal SRAM is already fragmented by the time `convai_start` runs; trying to allocate the sender's 4 KB stack from internal heap fails silently (no `sender_task started` log appears). Keep it in PSRAM — a few µs context-switch overhead is irrelevant for this task.
+- **Three convai task stacks live in PSRAM** via `xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM)`: `sender_task` (4 KB), `mic_task` (4 KB), `heartbeat_task` (3 KB). Only `playback_task` (4 KB) and the WS lib's own task (6 KB) remain in internal SRAM. By the time `convai_start` runs, internal heap is fragmented enough that 4 KB allocations may fit ONCE (playback) but the next one fails — silently, no panic. When `mic_task` failed to spawn, PTT did nothing (button events fired but no audio was sent) and the only signal was the `start: mic_task spawn FAILED` log line. Keep these three in PSRAM — a few µs context-switch overhead is irrelevant; the alternative is silent feature loss.
 - **On `WEBSOCKET_EVENT_DISCONNECTED`** the queue is drained (frames are for a dead session; replaying them against the reconnected session's fresh greeting context would confuse the server). `s_q_bytes_in` / `s_q_bytes_out` are reset.
 - **Observability** (heartbeat verbose line):
   - `q_depth=NB` — current backlog. Healthy steady state is 0; non-zero during PTT only if sender is briefly behind.
   - `q_block=N` — cumulative times producer blocked because queue was full. Should stay 0 in normal operation.
   - `q_retry=N` — cumulative `send_text` failures. Stays 0 on a healthy link; rises during real congestion.
   - `sender: sent #N (item=NB, last_fail_streak=K)` every 33 successful sends. Confirms sender is alive and how often it had to retry.
-- **Heap probe at WS start** (`start: heap_int=N largest_int=M psram=K before client_start`) is intentional — keep it. If `largest_int` ever drops below ~6500, the WS task spawn is at risk and we need to look at this again.
+- **Heap probe at WS start** (`start: heap_int=N largest_int=M psram=K before client_start`) is intentional — keep it. Confirmed baseline after OTA changes: `heap_int≈22 KB, largest_int≈7.6 KB`. The WS task takes that largest block; everything after has to fit in the next-largest fragment. That's why three of the four convai tasks live in PSRAM (above). If `largest_int` ever drops below ~6500, the WS task itself is at risk — investigate before doing anything else.
 - **Don't reintroduce direct `send_text` calls in `mic_task`**. The whole fix is that the WS lib never sees a fail-fast pattern from us. A single direct send from the mic loop would re-introduce the bug.
+
+## OTA — boot-time GitHub release pull
+Release runbook: [`DEPLOYMENT.md`](DEPLOYMENT.md). Implementation: [`main/OTA/ota.c`](main/OTA/ota.c).
+
+- **Partitions** ([`partitions.csv`](partitions.csv)): `nvs (24K)` · `otadata (8K)` · `ota_0 (4M)` · `ota_1 (4M)`. App is ~1.5 MB today → 63% slot free. **No factory partition** — both slots are OTA.
+- **Boot order in `post_connect_task`** (load-bearing):
+  1. `log_sink_start(6666)` — UDP comes up FIRST so a crash in any later step is visible (USB-CDC is already dead by this point — `i2s_audio_init` killed it).
+  2. `orb_sntp_sync` — TLS cert validation needs the clock right.
+  3. `orb_ota_check_and_update_on_boot()` — **before** Supabase config fetch and convai_start.
+  4. `orb_refresh_config()` then `convai_start()`.
+- **Why OTA runs before config + convai**: OTA is the recovery floor. A broken release that crashes in `orb_refresh_config` or `convai_start` is unrecoverable if OTA is gated on those succeeding. As long as the orb gets to WiFi + DNS + TLS to GitHub, a bad firmware can be replaced.
+- **Version compare**: `CONFIG_APP_PROJECT_VER_FROM_GIT_DESCRIBE=y` bakes `git describe` (e.g. `v0.0.2`) into `esp_app_get_description()->version`. OTA fetches `https://api.github.com/repos/<OWNER>/<REPO>/releases/latest`, parses `tag_name`, compares with `strcmp != 0`. **Any** difference triggers download. Make sure you tag BEFORE building the release binary or the embedded version will be a junk `1-NOTAG-gXXXX` string.
+- **TLS**: bundle (`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y`) handles both `api.github.com` and the 302 redirect target `objects.githubusercontent.com`. Don't try to pin per-host — GitHub release downloads cross hosts.
+- **Releases body buffer goes on the HEAP, not the stack** — see big comment in `fetch_latest_release()`. 8 KB ctx + ~6 KB mbedTLS handshake on an 8 KB task stack overflows silently (no panic dump, just immediate reset). Symptom was: device logs `ota: GET https://...` then reboots. Same trap awaits anyone adding a second "fetch JSON from cloud" path.
+- **`post_connect_task` stack: 8192 bytes** (was 6144 originally for one TLS handshake). Two back-to-back handshakes (Supabase + GitHub) need the margin. Bigger stack steals internal SRAM that convai tasks would otherwise use — see PSRAM-tasks note above.
+- **Rollback safety**: `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. New images boot in `PENDING_VERIFY`. `orb_ota_mark_running_valid()` is called from the `WEBSOCKET_EVENT_CONNECTED` handler in `convai.c` — once WSS connects, we know WiFi/TLS/auth all work, mark the image valid. If a new build crashes before WSS, the bootloader reverts on the next power cycle.
+- **Repo coordinates** live in `secrets.h` as `OTA_GITHUB_OWNER` / `OTA_GITHUB_REPO`. Must point at a PUBLIC repo (anonymous request, no token). Currently `CollaboratorFuturity/futuresGarden_ESP`.
 
 ## NFC
 - Polling interval: 100 ms. Same-UID debounce: 1.5 s.

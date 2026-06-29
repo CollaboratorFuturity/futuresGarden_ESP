@@ -96,6 +96,12 @@ done:
 
 // Fetches https://api.github.com/repos/<owner>/<repo>/releases/latest using
 // the IDF cert bundle. Anonymous request — public repo, no token.
+//
+// IMPORTANT: body_ctx_t holds an 8 KB buffer; allocate it on the heap, NOT
+// the stack. The HTTPS GET nests through mbedTLS whose handshake adds ~5-7
+// KB of its own stack pressure on top of whatever we put in this frame.
+// Together with 8 KB of ctx we'd blow even an 8 KB task stack and crash
+// silently inside esp_http_client_perform.
 static bool fetch_latest_release(char *out_tag, size_t tag_sz,
                                  char *out_url, size_t url_sz)
 {
@@ -104,13 +110,17 @@ static bool fetch_latest_release(char *out_tag, size_t tag_sz,
              GITHUB_API_HOST, OTA_GITHUB_OWNER, OTA_GITHUB_REPO);
     ESP_LOGI(TAG, "GET %s", url);
 
-    body_ctx_t ctx = {0};
+    body_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        ESP_LOGE(TAG, "ctx calloc failed");
+        return false;
+    }
 
     esp_http_client_config_t cfg = {
         .url               = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .event_handler     = releases_http_event,
-        .user_data         = &ctx,
+        .user_data         = ctx,
         .timeout_ms        = 10000,
         // GitHub requires a User-Agent on every API request, else 403.
         .user_agent        = "orb-esp32/ota",
@@ -119,6 +129,7 @@ static bool fetch_latest_release(char *out_tag, size_t tag_sz,
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
         ESP_LOGE(TAG, "http_client_init failed");
+        free(ctx);
         return false;
     }
     // GitHub recommends an explicit Accept header, lets them serve the
@@ -129,19 +140,18 @@ static bool fetch_latest_release(char *out_tag, size_t tag_sz,
     int status    = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
 
+    bool ok = false;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP perform: %s", esp_err_to_name(err));
-        return false;
-    }
-    if (status != 200) {
+    } else if (status != 200) {
         ESP_LOGE(TAG, "HTTP status %d", status);
-        return false;
+    } else if (ctx->overflow || ctx->len == 0) {
+        ESP_LOGE(TAG, "bad body (len=%d, overflow=%d)", ctx->len, ctx->overflow);
+    } else {
+        ok = parse_latest_release(ctx->buf, out_tag, tag_sz, out_url, url_sz);
     }
-    if (ctx.overflow || ctx.len == 0) {
-        ESP_LOGE(TAG, "bad body (len=%d, overflow=%d)", ctx.len, ctx.overflow);
-        return false;
-    }
-    return parse_latest_release(ctx.buf, out_tag, tag_sz, out_url, url_sz);
+    free(ctx);
+    return ok;
 }
 
 void orb_ota_check_and_update_on_boot(void)

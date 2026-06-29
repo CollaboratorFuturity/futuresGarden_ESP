@@ -1,7 +1,7 @@
 # Futures Garden — Hardware Reference (ESP32-only build)
 
 Single source of truth for the electronics and wiring of the **ESP32-only**
-conversational orb (`futuresGarden_ESP32/LVGLastest_ESP-IDF`). Everything below
+conversational orb (this repo, `futuresGarden_ESP32`). Everything below
 was read out of the firmware drivers and `sdkconfig`, so it reflects what the
 code actually expects — if you rewire, change it here and in the driver header
 named in each row.
@@ -119,8 +119,10 @@ ADC1 one-shot with calibration, in `main/BAT_Driver/BAT_Driver.*`.
 | Scaling | `volts = cali_mV × 3.0 / 1000 / Measurement_offset` (≈3× external divider) |
 | Exposed as | `float BAT_analogVolts`, `BAT_Get_Volts()` |
 
-Feeds the UI via `orb_ui_set_battery(float volts)`, which maps 3.0 V → 0 % and
-4.17 V → 100 % for the battery label.
+Feeds the UI via `orb_ui_set_battery(float volts)`, which maps **3.55 V → 0 %** and
+**3.93 V → 100 %** for the battery label (`BATTERY_MV_EMPTY` / `BATTERY_MV_FULL` in
+`main/LVGL_UI/orb_ui.c`). Those anchors are **board-after-harness-drop** readings, not cell
+voltage — see [BATTERY.md](BATTERY.md) for why.
 
 ---
 

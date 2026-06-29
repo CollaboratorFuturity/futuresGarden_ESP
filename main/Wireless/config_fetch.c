@@ -5,9 +5,13 @@
 #include <time.h>
 #include <sys/time.h>
 
+#include <stdlib.h>
+
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
 #include "cJSON.h"
@@ -164,4 +168,90 @@ bool orb_config_fetch(OrbConfig *out)
 
     memset(out, 0, sizeof(*out));
     return parse_config(ctx.buf, out);
+}
+
+// ─── NFC tag table download ─────────────────────────────────────────────────
+//
+// The tag map (UID -> phrase) is hosted as a raw file on the public GitHub repo
+// and pulled fresh each session. It's small today (~5 KB) but give it generous
+// headroom; the buffer lives in PSRAM so it never pressures internal SRAM.
+
+#define NFC_TAGS_BODY_MAX (32 * 1024)
+
+typedef struct {
+    char *buf;
+    int   cap;
+    int   len;
+    bool  overflow;
+} tags_ctx_t;
+
+static esp_err_t tags_http_event(esp_http_client_event_t *evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
+    tags_ctx_t *ctx = (tags_ctx_t *)evt->user_data;
+    if (!ctx || ctx->overflow) return ESP_OK;
+
+    int room = ctx->cap - 1 - ctx->len;
+    if (evt->data_len > room) {
+        ctx->overflow = true;
+        ESP_LOGW(TAG, "nfc tags body > %d bytes; truncating", ctx->cap);
+        return ESP_OK;
+    }
+    memcpy(ctx->buf + ctx->len, evt->data, evt->data_len);
+    ctx->len += evt->data_len;
+    ctx->buf[ctx->len] = '\0';
+    return ESP_OK;
+}
+
+char *orb_nfc_tags_fetch(void)
+{
+    // PSRAM if available, else internal — either way freed by the caller with free().
+    char *buf = heap_caps_malloc(NFC_TAGS_BODY_MAX, MALLOC_CAP_SPIRAM);
+    if (!buf) buf = malloc(NFC_TAGS_BODY_MAX);
+    if (!buf) {
+        ESP_LOGE(TAG, "nfc tags buf alloc (%d B) failed", NFC_TAGS_BODY_MAX);
+        return NULL;
+    }
+
+    tags_ctx_t ctx = { .buf = buf, .cap = NFC_TAGS_BODY_MAX, .len = 0, .overflow = false };
+
+    ESP_LOGI(TAG, "GET %s", NFC_TAGS_URL);
+    esp_http_client_config_t cfg = {
+        .url               = NFC_TAGS_URL,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler     = tags_http_event,
+        .user_data         = &ctx,
+        .timeout_ms        = 10000,
+        .user_agent        = "orb-esp32/nfc-tags",
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "nfc tags http_client_init failed");
+        free(buf);
+        return NULL;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status    = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nfc tags HTTP perform: %s", esp_err_to_name(err));
+        free(buf);
+        return NULL;
+    }
+    if (status != 200) {
+        ESP_LOGE(TAG, "nfc tags HTTP status %d", status);
+        free(buf);
+        return NULL;
+    }
+    if (ctx.overflow || ctx.len == 0) {
+        ESP_LOGE(TAG, "nfc tags bad body (len=%d, overflow=%d)", ctx.len, ctx.overflow);
+        free(buf);
+        return NULL;
+    }
+
+    ESP_LOGI(TAG, "nfc tags fetched (%d bytes)", ctx.len);
+    return buf;
 }

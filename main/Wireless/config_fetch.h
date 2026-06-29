@@ -24,3 +24,9 @@ bool orb_sntp_sync(int timeout_ms);
 // GET SUPABASE_CONFIG_URL?device_id=<id> over HTTPS, parse JSON into `out`.
 // Returns true on success. Streams body via event handler; bounded to 1 KB.
 bool orb_config_fetch(OrbConfig *out);
+
+// Download the NFC tag table (NFC_TAGS_URL, raw file on GitHub) over HTTPS into
+// a freshly-allocated, NUL-terminated buffer. Caller owns it — free() when done.
+// Uses the IDF cert bundle (not the pinned Supabase cert). Returns NULL on any
+// failure (alloc / network / TLS / non-200 / empty / oversized).
+char *orb_nfc_tags_fetch(void);

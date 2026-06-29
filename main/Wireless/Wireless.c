@@ -49,21 +49,30 @@ bool orb_refresh_config(void)
 
 static void post_connect_task(void *arg)
 {
+    // UDP log sink FIRST — audio_init has already killed USB-CDC by the
+    // time we get here, and anything that crashes between this point and
+    // `convai_start` would otherwise be invisible. Catch all of it on UDP.
+    log_sink_start(6666);
+    ESP_LOGI(WIFI_TAG, "post_connect_task: UDP sink up");
+
+    // SNTP must come before any TLS — cert validation needs the clock.
+    orb_sntp_sync(15000);
+    ESP_LOGI(WIFI_TAG, "post_connect_task: SNTP done");
+
+    // OTA check runs BEFORE the Supabase config fetch and before anything
+    // else that could brick the orb. This makes OTA the absolute recovery
+    // floor: as long as the orb can reach WiFi + GitHub, a bad release can
+    // be replaced. If we ever ship a build that crashes in orb_refresh_config
+    // or convai_start, the orb keeps rebooting INTO this OTA check and will
+    // pull the fix. Putting OTA after config would have made that scenario
+    // unrecoverable.
+    orb_ota_check_and_update_on_boot();
+    ESP_LOGI(WIFI_TAG, "post_connect_task: OTA check returned");
+
     orb_ui_set_state(ORB_CONFIG);
 
-    orb_sntp_sync(15000);
-
     if (orb_refresh_config()) {
-        // Stand up the UDP log sink before the conversation kicks off so
-        // every WSS / convai event is visible.
-        log_sink_start(6666);
-
-        // OTA check: runs here, before Convai allocates its PSRAM buffers
-        // and fragments internal SRAM. On a successful update this calls
-        // esp_restart() and never returns; on "no update" or failure it
-        // returns and boot continues into the conversation.
-        orb_ota_check_and_update_on_boot();
-
+        ESP_LOGI(WIFI_TAG, "post_connect_task: config OK; starting convai");
         // Auto-start the conversation. No idle SPLASH state any more —
         // the device goes straight from CONFIG to LOADING → agent greeting.
         // NFC scans still restart the session (see nfc.c::handle_uid).
@@ -99,7 +108,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         WiFi_Connected = true;
         // CONFIG state is set inside post_connect_task, AFTER the WIFI→
         // CONFIG transition beep. UI stays on ORB_WIFI until then.
-        xTaskCreatePinnedToCore(post_connect_task, "orb_postcon", 6144, NULL, 4, NULL, 0);
+        // 8 KB stack: post_connect_task now does TWO back-to-back TLS handshakes
+        // (Supabase config + GitHub /releases/latest) plus esp_https_ota's own
+        // setup if an update is found. 6 KB was tight for one handshake; two is
+        // unsafe. Internal SRAM is still healthy at this point — Convai's PSRAM
+        // buffers haven't been allocated yet.
+        xTaskCreatePinnedToCore(post_connect_task, "orb_postcon", 8192, NULL, 4, NULL, 0);
     }
 }
 

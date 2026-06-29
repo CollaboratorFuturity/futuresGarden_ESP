@@ -274,8 +274,9 @@ static void orb_tick_cb(lv_timer_t *t)
         if (mv < 0) {
             lv_label_set_text(s_battery_label, "");
         } else {
-            // Percent from BATTERY_MV_EMPTY (3.0 V → 0 %) to
-            // BATTERY_MV_FULL (4.17 V → 100 %), clamped.
+            // Percent from BATTERY_MV_EMPTY (3.55 V → 0 %) to
+            // BATTERY_MV_FULL (3.93 V → 100 %), clamped. Anchors are
+            // board-after-harness-drop readings, not cell voltage — see BATTERY.md.
             int span = BATTERY_MV_FULL - BATTERY_MV_EMPTY;
             int pct  = ((mv - BATTERY_MV_EMPTY) * 100) / span;
             if (pct < 0)   pct = 0;

@@ -123,14 +123,20 @@ Most of our reliability features are direct ports of Pi behaviour.
 | Mic base64 buffer | 1284 B | PSRAM | `convai_start` | Encoded form of one frame. |
 | Mic JSON buffer | 1348 B | PSRAM | `convai_start` | Wrapped form: `{"user_audio_chunk":"<base64>"}`. |
 | WS lib task stack | 6144 B | **Internal SRAM** (allocated by the lib) | inside `esp_websocket_client_start` | Was 8192. See "WSS task stack" in CLAUDE.md and the troubleshooting section below. |
-| `playback_task` stack | 4096 B | Internal SRAM | `convai_start` | Pinned core 1. |
-| `mic_task` stack | 4096 B | Internal SRAM | `convai_start` | Pinned core 1. |
-| `heartbeat_task` stack | 3072 B | Internal SRAM | `convai_start` | Pinned core 0. |
+| `playback_task` stack | 4096 B | Internal SRAM | `convai_start` | Pinned core 1. The only convai task still in internal SRAM. |
+| `mic_task` stack | 4096 B | **PSRAM** (via `xTaskCreatePinnedToCoreWithCaps`) | `convai_start` | **Must be PSRAM** — see troubleshooting. Pinned core 1. |
+| `heartbeat_task` stack | 3072 B | **PSRAM** (via `xTaskCreatePinnedToCoreWithCaps`) | `convai_start` | **Must be PSRAM** — see troubleshooting. Pinned core 0. |
 | `sender_task` stack | 4096 B | **PSRAM** (via `xTaskCreatePinnedToCoreWithCaps`) | `convai_start` | **Must be PSRAM** — see troubleshooting. Pinned core 0. |
 
-Total internal SRAM cost at runtime: ~17 KB just for our task stacks +
-6 KB for the WS lib task. Steady-state free internal heap during heavy
-audio is **6–12 KB**. There is no room for growth — if you need more
+Three of the four convai tasks (`mic_task`, `heartbeat_task`, `sender_task`)
+live in PSRAM; only `playback_task` (4 KB) stays in internal SRAM. So total
+internal SRAM cost at runtime is **~4 KB for our one internal task stack +
+6 KB for the WS lib task**. By the time `convai_start` runs — after the OTA
+path's two TLS handshakes and the WS task claiming the largest internal
+block — internal heap is fragmented enough that a second/third 4 KB internal
+stack allocation fails *silently* (no panic), and PTT would do nothing
+because `mic_task` never spawned. Steady-state free internal heap during
+heavy audio is **6–12 KB**. There is no room for growth — if you need more
 stack anywhere, take it from PSRAM via `xTaskCreatePinnedToCoreWithCaps`.
 
 ---

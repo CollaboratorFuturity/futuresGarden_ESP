@@ -1109,17 +1109,38 @@ bool convai_start(const char *agent_id)
                                  &s_playback_task, 1) != pdPASS) {
         ESP_LOGE(TAG, "start: playback_task spawn FAILED");
     }
-    // Mic task streams the mic to the server whenever PTT is held.
-    if (xTaskCreatePinnedToCore(mic_task,      "convai_mic",  4096, NULL, 5,
-                                 &s_mic_task,      1) != pdPASS) {
-        ESP_LOGE(TAG, "start: mic_task spawn FAILED");
+    // Mic and heartbeat task stacks live in PSRAM (same pattern as
+    // sender_task above) — by the time convai_start runs, the OTA path has
+    // already done two TLS handshakes (Supabase + GitHub) plus the WS task
+    // just claimed the largest internal-SRAM block, leaving fragments too
+    // small for 4 KB / 3 KB internal allocations. Without PSRAM these
+    // tasks silently fail to spawn and PTT does nothing (mic_task never
+    // reads s_ptt_held).
+    {
+        BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(
+            mic_task, "convai_mic", 4096, NULL, 5,
+            &s_mic_task, 1, MALLOC_CAP_SPIRAM);
+        if (rc != pdPASS) {
+            ESP_LOGE(TAG, "start: mic_task spawn FAILED (rc=%d, "
+                          "heap_int=%u largest=%u psram=%u)",
+                     (int)rc,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            s_mic_task = NULL;
+        }
     }
     // Heartbeat: low-priority background task, prints one diagnostic line
     // every 2s for the lifetime of the conversation. Stack is small —
     // it only calls esp_log + heap_caps + atomic reads.
-    if (xTaskCreatePinnedToCore(heartbeat_task, "convai_hb",  3072, NULL, 1,
-                                 &s_heartbeat_task, 0) != pdPASS) {
-        ESP_LOGE(TAG, "start: heartbeat_task spawn FAILED");
+    {
+        BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(
+            heartbeat_task, "convai_hb", 3072, NULL, 1,
+            &s_heartbeat_task, 0, MALLOC_CAP_SPIRAM);
+        if (rc != pdPASS) {
+            ESP_LOGE(TAG, "start: heartbeat_task spawn FAILED (rc=%d)", (int)rc);
+            s_heartbeat_task = NULL;
+        }
     }
 
     ESP_LOGI(TAG, "start: connecting to %s", uri);
@@ -1157,6 +1178,29 @@ void convai_stop(void)
     if (s_queue_storage) { free(s_queue_storage); s_queue_storage = NULL; }
     s_reasm_len = 0;
     ESP_LOGI(TAG, "stop: torn down");
+}
+
+bool convai_send_user_message(const char *text)
+{
+    if (!s_running || !s_ws || !text || !text[0]) return false;
+
+    // Build {"type":"user_message","text":"<text>"} with cJSON so the phrase is
+    // correctly JSON-escaped (it can contain quotes/UTF-8).
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return false;
+    cJSON_AddStringToObject(root, "type", "user_message");
+    cJSON_AddStringToObject(root, "text", text);
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) return false;
+
+    // Direct send (not via the mic ring buffer) — this is a rare one-shot, same
+    // class as pong / user_activity / send_initiation.
+    int n = esp_websocket_client_send_text(s_ws, payload, strlen(payload), pdMS_TO_TICKS(2000));
+    if (n > 0) { s_last_tx_us = esp_timer_get_time(); s_tx_bytes_total += n; }
+    ESP_LOGI(TAG, "user_message injected (rc=%d): \"%s\"", n, text);
+    free(payload);
+    return n > 0;
 }
 
 bool convai_is_running(void)

@@ -178,7 +178,7 @@ Need a bigger one? Tell me — I add it via Kconfig.
 - **Background:**
 - **Central element:**
 - **Around it:**
-- **Text:** a % based on the Battery Voltage value. 3.0 volts is 0% and 4.17 is 100%. "Battery: " followed by "xxx %". The % label is green when over 65%, yellow between 30-65%, and red when under 30%.
+- **Text:** a % based on the Battery Voltage value, rendered as `"NN% - N.NNV"`. As implemented, **3.55 V → 0 %** and **3.93 V → 100 %** (board-after-drop anchors, `BATTERY_MV_EMPTY`/`BATTERY_MV_FULL`; the original 3.0/4.17 design intent didn't survive the harness IR-drop calibration — see [BATTERY.md](BATTERY.md)). The % label is green when over 65%, amber/yellow between 30–65%, and red when under 30%.
 - **Animation / motion:**
 - **Enter transition:**
 - **Exit transition:**
