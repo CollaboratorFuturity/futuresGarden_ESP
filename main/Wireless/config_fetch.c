@@ -9,6 +9,7 @@
 
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "nvs.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
@@ -31,7 +32,17 @@ typedef struct {
     bool  overflow;
 } body_ctx_t;
 
-void orb_device_id(char *out, size_t out_len)
+// NVS storage for the orb's identity. Kept OUT of the firmware image so a
+// single shared OTA release can run on every orb without homogenizing them:
+// the binary may carry any baked DEVICE_ID, but a provisioned orb always reads
+// its own id back from NVS (NVS lives in its own partition, untouched by app
+// OTA). Key length stays under the 15-char NVS limit.
+#define ORB_NVS_NS   "orb_cfg"
+#define ORB_NVS_KEY  "device_id"
+
+// Compile-time seed used only to provision an as-yet-unprovisioned orb: the
+// friendly DEVICE_ID from secrets.h if set, else a unique id from the STA MAC.
+static void device_id_seed(char *out, size_t out_len)
 {
 #ifdef DEVICE_ID
     snprintf(out, out_len, "%s", DEVICE_ID);
@@ -39,6 +50,51 @@ void orb_device_id(char *out, size_t out_len)
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(out, out_len, "orb-%02X%02X%02X", mac[3], mac[4], mac[5]);
+#endif
+}
+
+// Resolve this orb's device_id. Resolution order:
+//   1. DEVICE_ID set AND DEVICE_ID_OVERWRITE=1 → force-(re)write NVS from the
+//      compile-time id. One-off provisioning escape hatch — NEVER ship a
+//      release with DEVICE_ID_OVERWRITE=1 or every orb re-stamps to that id.
+//   2. NVS holds a device_id → use it. The normal, OTA-safe path.
+//   3. Unprovisioned (NVS empty) → seed NVS once from DEVICE_ID (or MAC) and
+//      use that. Write-once, so later OTA releases can't change it.
+void orb_device_id(char *out, size_t out_len)
+{
+    nvs_handle_t h;
+
+#if defined(DEVICE_ID) && (DEVICE_ID_OVERWRITE + 0)
+    if (nvs_open(ORB_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, ORB_NVS_KEY, DEVICE_ID);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    snprintf(out, out_len, "%s", DEVICE_ID);
+    ESP_LOGW(TAG, "device_id=%s (FORCED via DEVICE_ID_OVERWRITE — must be 0 in releases)", out);
+    return;
+#else
+    // 2. NVS-provisioned id wins.
+    if (nvs_open(ORB_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = out_len;
+        esp_err_t e = nvs_get_str(h, ORB_NVS_KEY, out, &len);
+        nvs_close(h);
+        if (e == ESP_OK && out[0]) {
+            ESP_LOGI(TAG, "device_id=%s (from NVS)", out);
+            return;
+        }
+    }
+
+    // 3. Unprovisioned — seed once and persist so OTA can't change it later.
+    char seed[ORB_DEVICE_ID_MAX];
+    device_id_seed(seed, sizeof(seed));
+    if (nvs_open(ORB_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, ORB_NVS_KEY, seed);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    snprintf(out, out_len, "%s", seed);
+    ESP_LOGI(TAG, "device_id=%s (seeded into NVS on first boot)", out);
 #endif
 }
 
