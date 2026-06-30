@@ -70,7 +70,16 @@ menu "Example Configuration"
         
     config BT_BLE_42_FEATURES_SUPPORTED
         bool "This enables BLE 4.2 features."
-        default y 
+        default y
+
+    config ORB_OTA_UPDATE_DEV_BUILDS
+        bool "Allow OTA auto-update on dev builds (disables the dev-build guard)"
+        default n
+        help
+            Normally OTA is skipped for dev builds (versions containing -g/-dirty/
+            NOTAG) so a locally flashed image is never auto-downgraded to the latest
+            release. Enable this ONLY to test OTA on a dev build. Lives in the local
+            gitignored sdkconfig — never ship it enabled in a release.
 endmenu
 
  

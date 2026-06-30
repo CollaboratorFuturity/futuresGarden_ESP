@@ -171,11 +171,16 @@ void orb_ota_check_and_update_on_boot(void)
     // latest published release is — clobbering the local work you just flashed.
     // So skip the OTA check entirely for non-release builds; only clean tagged
     // images participate in auto-update.
+#if !CONFIG_ORB_OTA_UPDATE_DEV_BUILDS
     if (strstr(running_ver, "-dirty") || strstr(running_ver, "-g") ||
         strstr(running_ver, "NOTAG")) {
         ESP_LOGW(TAG, "dev build (%s) — skipping OTA auto-update", running_ver);
         return;
     }
+#else
+    ESP_LOGW(TAG, "dev-guard DISABLED (CONFIG_ORB_OTA_UPDATE_DEV_BUILDS) — "
+                  "dev build %s will take OTA updates", running_ver);
+#endif
 
     char latest_tag[64]    = {0};
     char asset_url[256]    = {0};
