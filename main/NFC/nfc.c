@@ -367,10 +367,12 @@ static void nfc_task(void *arg)
     }
     ESP_LOGI(PN532_TAG, "PN532 ready, polling every %d ms", POLL_PERIOD_MS);
 
-    // Warm the tag table once before polling so the first scan has no download
-    // latency. Best-effort — if the network isn't up yet this fails and the
-    // first scan's lazy reload (in handle_uid) covers it.
-    nfc_tags_reload();
+    // NOTE: do NOT download the tag table here. nfc_task reaches this point
+    // ~1.6 s into boot — before WiFi/netif is up and before SNTP — so a TLS
+    // GET to GitHub at this stage hits an interface that isn't ready and can
+    // fault, taking the whole device into a boot loop (glitched frame, dies
+    // before the UDP log sink even starts). The table is loaded lazily on the
+    // first scan instead (handle_uid), by which point the network is stable.
 
     // Heartbeat: every ~10 s, log a summary so the UDP sink shows the task
     // is alive and how often pn532_read_passive_target is failing vs

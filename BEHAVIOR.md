@@ -206,6 +206,8 @@ JSON map of UID → phrase. UIDs are normalized to `XX:XX:XX[:XX]` uppercase hex
 
 The library is fetched from a configured URL on boot/hot-reload and cached in NVS as offline fallback.
 
+> **ESP32 note:** the library is **downloaded from GitHub each session** (`NFC_TAGS_URL` in `secrets.h` → a raw file on the public OTA repo, fetched via the IDF cert bundle in `config_fetch.c::orb_nfc_tags_fetch()`). There is **no NVS cache / no offline fallback** — the orb needs internet to converse at all, so an offline-only table would never be exercised. UID keys are colon-hex uppercase (`uid_to_hex` matches the JSON format exactly). The table is reloaded on every AGENT_START/TEST scan, so editing the GitHub file lands on the next scan with no reflash (subject to raw.githubusercontent.com's ~5 min CDN cache).
+
 ### 6.2 Tag table
 
 | Tag | State at scan | Behavior |
@@ -219,6 +221,8 @@ The library is fetched from a configured URL on boot/hot-reload and cached in NV
 
 Source: `nfc_backend.py:267-298`, `main.py:303-339`.
 
+> **ESP32 note:** this firmware has **no `splash_idle` state** — it boots straight into a persistent `running_agent` session. So the table collapses: `AGENT_START` and `TEST` both mean "reload config + tag table, then restart the session" (there's no separate splash/temp-WSS greeting). A custom-phrase tag injects `{"type":"user_message","text":"<phrase>"}` into the live WSS via `convai_send_user_message()` with no restart; `force_turn_end` is unnecessary because NFC only scans while PTT is released (§6.4). A custom-phrase tag scanned with no live session (rare) falls back to a restart and the phrase is dropped. Unmapped UIDs are ignored exactly as specified (silently — no tone, no state change). Implemented in `nfc.c::handle_uid`.
+
 ### 6.3 Debounce
 
 Same UID read within **1.5 s** of the previous read is ignored. Different UIDs bypass the debounce.
@@ -230,6 +234,8 @@ Source: `nfc_backend.py:39, 262`.
 NFC scanning is **disabled** during the user turn audio capture (prevents tag reads from corrupting the audio path) and **enabled** during agent response and idle. Implemented as an internal flag the polling loop checks.
 
 Source: `nfc_backend.py:287` (disable on phrase inject), `main.py:1051, 1078, 1286` (enable around turns).
+
+> **ESP32 note (stricter than the Pi):** scanning is allowed **only in the idle `ORB_MUTED` window** between turns — it is suppressed during user-turn capture (`ORB_USER_TALK`), while waiting for the agent (`ORB_LOADING`), **and while the agent is speaking (`ORB_AGENT`)**. The Pi keeps NFC live during the agent response; this build does not, so a tag can't interrupt or be read over a turn at all. Implemented at the single state-transition choke point: `orb_ui.c::orb_ui_set_state()` calls `NFC_Set_Polling(s == ORB_MUTED)`, flipping the same `s_polling_enabled` flag the poll loop checks.
 
 ### 6.5 Init failure (defensive)
 

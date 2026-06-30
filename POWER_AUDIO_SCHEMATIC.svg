@@ -1,0 +1,194 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 880" font-family="Helvetica, Arial, sans-serif">
+  <style>
+    .mod   { fill:#ffffff; stroke:#222; stroke-width:2; rx:8; }
+    .title { font-size:15px; font-weight:bold; fill:#111; }
+    .sub   { font-size:10px; fill:#666; }
+    .pin   { font-size:11px; fill:#111; }
+    .note  { font-size:11px; fill:#444; }
+    .vbatt { stroke:#D32F2F; stroke-width:3; fill:none; }
+    .v5    { stroke:#E65100; stroke-width:3; fill:none; }
+    .v3    { stroke:#F9A825; stroke-width:2.5; fill:none; }
+    .gnd   { stroke:#000;    stroke-width:3; fill:none; }
+    .clk   { stroke:#1565C0; stroke-width:2; fill:none; }
+    .dout  { stroke:#2E7D32; stroke-width:2; fill:none; }
+    .din   { stroke:#6A1B9A; stroke-width:2; fill:none; }
+    .cfg   { stroke:#000; stroke-width:1.5; fill:none; stroke-dasharray:4 3; }
+    .spk   { stroke:#5D4037; stroke-width:2.5; fill:none; }
+    .dot   { fill:#111; }
+    .zone  { fill:#fafafa; stroke:#ddd; stroke-width:1; }
+    .zlbl  { font-size:12px; font-weight:bold; fill:#999; letter-spacing:1px; }
+  </style>
+
+  <text x="30" y="34" font-size="20" font-weight="bold" fill="#111">Futures Garden — Power + Audio Schematic</text>
+  <text x="30" y="54" class="sub">Standalone ESP32-S3 orb. Hand-wired power path and audio breakouts. All grounds common.</text>
+
+  <!-- ===== POWER ZONE ===== -->
+  <rect x="20" y="70" width="1200" height="330" class="zone"/>
+  <text x="34" y="90" class="zlbl">POWER</text>
+
+  <!-- LiPo -->
+  <rect x="40" y="120" width="130" height="90" class="mod"/>
+  <text x="50" y="145" class="title">LiPo 3.7V</text>
+  <text x="50" y="162" class="sub">3500 mAh + PCM</text>
+  <circle cx="170" cy="150" r="3.5" class="dot"/><text x="120" y="146" class="pin">+</text>
+  <circle cx="170" cy="185" r="3.5" class="dot"/><text x="120" y="190" class="pin">−</text>
+
+  <!-- USB-C -->
+  <rect x="40" y="270" width="130" height="60" class="mod"/>
+  <text x="50" y="295" class="title">USB-C 5V</text>
+  <text x="50" y="312" class="sub">charge source</text>
+  <circle cx="170" cy="300" r="3.5" class="dot"/>
+
+  <!-- TC4056 -->
+  <rect x="240" y="120" width="160" height="210" class="mod"/>
+  <text x="252" y="145" class="title">TC4056</text>
+  <text x="252" y="162" class="sub">USB-C charger (1A)</text>
+  <circle cx="240" cy="150" r="3.5" class="dot"/><text x="248" y="146" class="pin">B+</text>
+  <circle cx="240" cy="185" r="3.5" class="dot"/><text x="248" y="190" class="pin">B−</text>
+  <circle cx="240" cy="300" r="3.5" class="dot"/><text x="248" y="296" class="pin">USB</text>
+  <circle cx="400" cy="150" r="3.5" class="dot"/><text x="356" y="146" class="pin">OUT+</text>
+  <circle cx="400" cy="185" r="3.5" class="dot"/><text x="358" y="190" class="pin">OUT−</text>
+
+  <!-- Switch -->
+  <rect x="470" y="120" width="120" height="64" class="mod"/>
+  <text x="482" y="145" class="title">SW1</text>
+  <text x="482" y="162" class="sub">ON/OFF ≥3A</text>
+  <circle cx="470" cy="150" r="3.5" class="dot"/>
+  <circle cx="590" cy="150" r="3.5" class="dot"/>
+
+  <!-- SYS+ node -->
+  <circle cx="650" cy="150" r="4.5" class="dot"/>
+  <text x="630" y="140" class="pin">SYS+</text>
+
+  <!-- Boost -->
+  <rect x="470" y="240" width="170" height="120" class="mod"/>
+  <text x="482" y="265" class="title">Boost → 5.0V</text>
+  <text x="482" y="282" class="sub">≥2A, set trimpot</text>
+  <circle cx="470" cy="290" r="3.5" class="dot"/><text x="478" y="286" class="pin">VIN+</text>
+  <circle cx="470" cy="325" r="3.5" class="dot"/><text x="478" y="330" class="pin">VIN−</text>
+  <circle cx="640" cy="290" r="3.5" class="dot"/><text x="592" y="286" class="pin">VOUT+</text>
+  <circle cx="640" cy="325" r="3.5" class="dot"/><text x="592" y="330" class="pin">VOUT−</text>
+
+  <!-- ESP board -->
+  <rect x="930" y="100" width="280" height="280" class="mod"/>
+  <text x="945" y="126" class="title">ESP32-S3 board</text>
+  <text x="945" y="142" class="sub">Touch-LCD-2.8C · J9 header</text>
+  <circle cx="930" cy="170" r="3.5" class="dot"/><text x="940" y="174" class="pin">BAT+ (batt input)</text>
+  <circle cx="930" cy="200" r="3.5" class="dot"/><text x="940" y="204" class="pin">GND</text>
+  <circle cx="930" cy="230" r="3.5" class="dot"/><text x="940" y="234" class="pin">3V3</text>
+  <circle cx="930" cy="262" r="3.5" class="dot"/><text x="940" y="266" class="pin">GPIO43  BCLK/TXD</text>
+  <circle cx="930" cy="292" r="3.5" class="dot"/><text x="940" y="296" class="pin">GPIO44  WS/RXD</text>
+  <circle cx="930" cy="322" r="3.5" class="dot"/><text x="940" y="326" class="pin">GPIO19  DOUT/D−</text>
+  <circle cx="930" cy="352" r="3.5" class="dot"/><text x="940" y="356" class="pin">GPIO20  DIN/D+</text>
+
+  <!-- POWER WIRES -->
+  <!-- batt + to TC4056 B+ -->
+  <path class="vbatt" d="M170,150 H240"/>
+  <!-- batt - to TC4056 B- -->
+  <path class="gnd"   d="M170,185 H240"/>
+  <!-- usb-c to TC4056 USB -->
+  <path class="gnd"   d="M170,300 H240" stroke="#999"/>
+  <!-- TC4056 OUT+ to switch -->
+  <path class="vbatt" d="M400,150 H470"/>
+  <!-- switch to SYS+ -->
+  <path class="vbatt" d="M590,150 H650"/>
+  <!-- SYS+ to ESP BAT+ -->
+  <path class="vbatt" d="M650,150 H880 V170 H930"/>
+  <!-- SYS+ down to boost VIN+ -->
+  <path class="vbatt" d="M650,150 V290 H470"/>
+  <!-- TC4056 OUT- to GND rail -->
+  <path class="gnd"   d="M400,185 H430 V410 H1090 V200 H930"/>
+  <!-- boost VIN- to GND rail -->
+  <path class="gnd"   d="M470,325 H440 V410"/>
+  <!-- boost VOUT+ (5V) down to amp -->
+  <path class="v5"    d="M640,290 H690 V470"/>
+  <!-- boost VOUT- to GND rail -->
+  <path class="gnd"   d="M640,325 H660 V410"/>
+  <!-- 3V3 from ESP to mic -->
+  <path class="v3"    d="M930,230 H905 V560 H520"/>
+
+  <!-- ===== AUDIO ZONE ===== -->
+  <rect x="20" y="430" width="1200" height="420" class="zone"/>
+  <text x="34" y="450" class="zlbl">AUDIO / SIGNAL</text>
+
+  <!-- MAX98357A -->
+  <rect x="600" y="480" width="200" height="250" class="mod"/>
+  <text x="612" y="506" class="title">MAX98357A</text>
+  <text x="612" y="522" class="sub">amp · GAIN→GND = 12dB</text>
+  <circle cx="600" cy="550" r="3.5" class="dot"/><text x="610" y="554" class="pin">Vin (5V)</text>
+  <circle cx="600" cy="580" r="3.5" class="dot"/><text x="610" y="584" class="pin">GND</text>
+  <circle cx="600" cy="610" r="3.5" class="dot"/><text x="610" y="614" class="pin">BCLK</text>
+  <circle cx="600" cy="640" r="3.5" class="dot"/><text x="610" y="644" class="pin">LRC</text>
+  <circle cx="600" cy="670" r="3.5" class="dot"/><text x="610" y="674" class="pin">DIN</text>
+  <circle cx="600" cy="700" r="3.5" class="dot"/><text x="610" y="704" class="pin">GAIN</text>
+  <circle cx="800" cy="560" r="3.5" class="dot"/><text x="752" y="556" class="pin">SPK+</text>
+  <circle cx="800" cy="600" r="3.5" class="dot"/><text x="754" y="596" class="pin">SPK−</text>
+  <text x="612" y="724" class="note">SD = n/c (auto-enable)</text>
+
+  <!-- C1 bulk cap at amp Vin -->
+  <text x="470" y="540" class="note">C1 470µF</text>
+  <path class="v5"  d="M520,550 H600"/>
+  <path class="v5"  d="M540,550 V520"/><line x1="528" y1="520" x2="552" y2="520" stroke="#E65100" stroke-width="3"/>
+  <line x1="531" y1="528" x2="549" y2="528" stroke="#000" stroke-width="3"/>
+  <path class="gnd" d="M540,528 V610 H560"/>
+
+  <!-- INMP441 -->
+  <rect x="340" y="560" width="180" height="200" class="mod"/>
+  <text x="352" y="586" class="title">INMP441</text>
+  <text x="352" y="602" class="sub">mic · L/R→GND (LEFT)</text>
+  <circle cx="520" cy="620" r="3.5" class="dot"/><text x="472" y="616" class="pin">VDD</text>
+  <circle cx="520" cy="650" r="3.5" class="dot"/><text x="472" y="654" class="pin">GND</text>
+  <circle cx="520" cy="680" r="3.5" class="dot"/><text x="468" y="684" class="pin">SCK</text>
+  <circle cx="520" cy="710" r="3.5" class="dot"/><text x="476" y="714" class="pin">WS</text>
+  <circle cx="520" cy="740" r="3.5" class="dot"/><text x="476" y="744" class="pin">SD</text>
+
+  <!-- Speaker -->
+  <rect x="900" y="540" width="120" height="100" class="mod"/>
+  <text x="912" y="566" class="title">Speaker</text>
+  <text x="912" y="582" class="sub">4–8Ω ≥3W</text>
+  <circle cx="900" cy="560" r="3.5" class="dot"/>
+  <circle cx="900" cy="600" r="3.5" class="dot"/>
+
+  <!-- AUDIO WIRES -->
+  <!-- amp Vin already fed by boost (v5 from above lands at 690,470 -> to Vin) -->
+  <path class="v5"  d="M690,470 V550 H600"/>
+  <!-- amp GND to GND rail -->
+  <path class="gnd" d="M600,580 H560 V610"/>
+  <path class="gnd" d="M560,610 V790 H1090 V410" />
+  <!-- clocks BCLK from GPIO43 -->
+  <path class="clk" d="M930,262 H860 V610 H600"/>
+  <!-- WS from GPIO44 to amp LRC -->
+  <path class="clk" d="M930,292 H840 V640 H600"/>
+  <!-- DOUT from GPIO19 to amp DIN -->
+  <path class="dout" d="M930,322 H820 V670 H600"/>
+  <!-- GAIN to GND -->
+  <path class="cfg" d="M600,700 H575 V790"/>
+  <!-- speaker -->
+  <path class="spk" d="M800,560 H900"/>
+  <path class="spk" d="M800,600 H900"/>
+
+  <!-- mic VDD already fed by 3V3 (v3 lands at 520,560) -->
+  <path class="v3"  d="M520,560 V620"/>
+  <!-- mic GND -->
+  <path class="gnd" d="M520,650 H560"/>
+  <!-- mic SCK from GPIO43 (tap clock net) -->
+  <path class="clk" d="M860,330 V760 H520 V680"/>
+  <!-- mic WS from GPIO44 -->
+  <path class="clk" d="M840,360 V775 H505 V710 H520"/>
+  <!-- mic SD to GPIO20 -->
+  <path class="din" d="M930,352 H905 V740 H520"/>
+  <!-- mic L/R to GND -->
+  <path class="cfg" d="M500,650 V820 H575"/>
+
+  <!-- ===== LEGEND ===== -->
+  <rect x="1010" y="640" width="210" height="200" fill="#fff" stroke="#ccc"/>
+  <text x="1022" y="660" font-size="12" font-weight="bold" fill="#111">NET LEGEND</text>
+  <line x1="1022" y1="678" x2="1052" y2="678" class="vbatt"/><text x="1060" y="682" class="pin">VBATT (3.0–4.2V)</text>
+  <line x1="1022" y1="698" x2="1052" y2="698" class="v5"/><text x="1060" y="702" class="pin">+5V (boosted)</text>
+  <line x1="1022" y1="718" x2="1052" y2="718" class="v3"/><text x="1060" y="722" class="pin">3V3</text>
+  <line x1="1022" y1="738" x2="1052" y2="738" class="gnd"/><text x="1060" y="742" class="pin">GND (common)</text>
+  <line x1="1022" y1="758" x2="1052" y2="758" class="clk"/><text x="1060" y="762" class="pin">I²S BCLK / WS</text>
+  <line x1="1022" y1="778" x2="1052" y2="778" class="dout"/><text x="1060" y="782" class="pin">DOUT → amp DIN</text>
+  <line x1="1022" y1="798" x2="1052" y2="798" class="din"/><text x="1060" y="802" class="pin">mic SD → DIN</text>
+  <line x1="1022" y1="818" x2="1052" y2="818" class="cfg"/><text x="1060" y="822" class="pin">config tie (GND)</text>
+</svg>

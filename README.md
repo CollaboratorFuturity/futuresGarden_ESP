@@ -104,11 +104,22 @@ WIFI_EVENT_STA_GOT_IP fires post_connect_task (8 KB stack):
   convai_start(agent_id)  # WSS opens → greeting plays. No idle SPLASH — the device
                         #   boots straight into a persistent conversation.
 
-On NFC tag scan (any tag, for now):
-  orb_ui_set_state(ORB_NFC)                                  # purple "NFC Scanned" — shown before the blopp
-  blopp tone                                                 # audible cue plays over the ORB_NFC screen
-  if convai_is_running(): convai_stop(); wait 200 ms        # restart (ORB_NFC stays up)
-  orb_refresh_config()                                       # re-fetch (volume / agent changes apply live); ORB_NFC stays up through the TLS GET
+On NFC tag scan (only fires in ORB_MUTED — polling is gated to the idle window):
+  uid → colon-hex ("04:38:17:9A:CB:2A:81")                   # matches nfc_tags.json keys
+  if !s_tags: nfc_tags_reload()                              # lazy download if boot warm-up missed
+  phrase = s_tags[uid]                                       # downloaded from GitHub (NFC_TAGS_URL)
+  if phrase is None: log "unmapped — ignoring"; return       # no tone, no state change
+
+  orb_ui_set_state(ORB_NFC); blopp tone                      # ack only for a mapped card
+
+  if phrase not in {AGENT_START, TEST} and convai_is_running():
+    orb_ui_set_state(ORB_LOADING)
+    convai_send_user_message(phrase)                         # inject into LIVE session, no restart
+    return
+  # AGENT_START / TEST (or phrase with no live session): reload + restart
+  nfc_tags_reload()
+  if convai_is_running(): convai_stop(); wait 200 ms        # ORB_NFC stays up
+  orb_refresh_config()                                       # volume / agent changes apply live
   orb_ui_set_state(ORB_LOADING)                              # amber + sweep: WSS connecting
   convai_start(agent_id) → WSS opens → greeting plays        # Convai tasks drive AGENT / USER_TALK / MUTED
 ```
@@ -234,9 +245,9 @@ main/
 ├── LVGL_UI/orb_ui.{c,h}            # Orb state machine + widgets
 ├── Wireless/
 │   ├── Wireless.{c,h}              # WiFi connect + event handler + agent_id cache
-│   ├── config_fetch.{c,h}          # SNTP + HTTPS GET + cJSON parse (Supabase)
+│   ├── config_fetch.{c,h}          # SNTP + HTTPS GET + cJSON parse (Supabase config; GitHub NFC tag-table download)
 │   └── log_sink.{c,h}              # UDP log redirect (esp_log_set_vprintf)
-├── NFC/nfc.{c,h}                   # PN532 driver, 100 ms polling, 1.5 s debounce
+├── NFC/nfc.{c,h}                   # PN532 driver, 100 ms polling, 1.5 s debounce, GitHub-downloaded tag table + dispatch (gated to ORB_MUTED)
 ├── Audio/i2s_audio.{c,h}           # Split I2S (TX=I2S0 master, RX=I2S1 slave) + DOUT mute
 ├── Button/button.{c,h}             # GPIO 0 PTT button (50 ms debounce, edge-trigger)
 ├── Convai/convai.{c,h}             # ElevenLabs ConvAI WSS client + PTT mic-stream task + playback task + send queue (1 MB PSRAM) + sender_task
@@ -318,7 +329,7 @@ Managed components are pulled via [`main/idf_component.yml`](main/idf_component.
 2. **GPIO 0 strap pull-up masks INMP441 SD line** — mic is on GPIO 20, NOT GPIO 0. Don't move it back.
 3. **Don't hold the PTT button at boot** — GPIO 0 LOW at reset = ROM download mode.
 4. **WSS task stack ≥ 8 KB** — cJSON + mbedTLS + base64 decode overflow the 4 KB default.
-5. **NFC task stack ≥ 8 KB** — `orb_refresh_config()` does an HTTPS GET with TLS, blows the 4 KB default.
+5. **NFC task stack ≥ 8 KB** — `handle_uid` can do two sequential HTTPS GETs with TLS (tag-table download + `orb_refresh_config()`); the 4 KB default overflows. They run one at a time, so 8 KB holds.
 6. **Pin TLS roots per host** — the built-in CA bundle didn't match either Supabase or ElevenLabs reliably on our build. We embed `gts_root_r4.pem` (Supabase) and `gts_root_r1.pem` (ElevenLabs).
 7. **WSS audio events are huge** — single events for short greetings have been seen at 250+ KB. The reassembly buffer is 2 MB PSRAM. Decode in 1 KB chunks with `portMAX_DELAY` backpressure so the PCM ring (128 KB) doesn't have to hold a whole turn.
 8. **DOUT mute (not channel-disable)** to silence the speaker during recording — TX channel must stay enabled or the mic loses BCLK/WS.

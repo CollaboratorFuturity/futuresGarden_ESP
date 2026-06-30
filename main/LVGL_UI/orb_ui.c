@@ -4,6 +4,8 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "nfc.h"
+
 #define ORB_CIRCLE_DIAM     200
 #define ORB_NAME_Y          90        // (legacy — name now lives inside the circle)
 #define ORB_BATTERY_Y       420       // UI_SPEC.md §0: bot-mid, y = 420
@@ -389,6 +391,16 @@ void orb_ui_init(void)
 void orb_ui_set_state(OrbState s)
 {
     atomic_store(&s_pending_state, s);
+
+    // Gate NFC scanning on the turn state. Tags may only be read in the idle
+    // ORB_MUTED window (between turns, before the user presses PTT). Scanning
+    // is suppressed while the user is talking (ORB_USER_TALK), while we wait
+    // for the agent (ORB_LOADING), and while the agent is speaking (ORB_AGENT),
+    // so a tag read can't interrupt or corrupt an active turn. orb_ui_set_state
+    // is the single point every module routes turn transitions through, which
+    // makes it the natural choke point for this. (NFC_Set_Polling just flips a
+    // volatile flag — safe from any task/context.)
+    NFC_Set_Polling(s == ORB_MUTED);
 }
 
 void orb_ui_set_agent_name(const char *name)

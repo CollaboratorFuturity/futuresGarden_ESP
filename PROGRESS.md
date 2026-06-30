@@ -94,25 +94,43 @@ then `convai_start()` drives the rest.
 - [x] **PTT** — see Phase 4
 - [x] **WSS stack**: `task_stack = 6144` (default 4 KB overflows cJSON + mbedTLS + decode chunk; was 8192 but internal-heap fragmentation by the time `convai_start` runs means the largest contiguous block is ~7.5 KB, so 8 KB fails to allocate — see CLAUDE.md / CONVAI.md)
 
-### NFC integration (test mode)
+### NFC integration (tag table — implemented)
 
-Per BEHAVIOR.md §6 the real tag table is AGENT_START / TEST / custom phrase. Today
-we treat every scanned tag as AGENT_START:
+The real BEHAVIOR.md §6 tag table is live. The UID→phrase map is **downloaded from
+GitHub each session** (`NFC_TAGS_URL` in `secrets.h`, raw file on the public OTA repo,
+fetched via the cert bundle in `config_fetch.c::orb_nfc_tags_fetch()` into a 32 KB PSRAM
+buffer). No embed, no NVS cache — the orb needs internet to converse anyway. Parsed into
+`cJSON *s_tags`, owned solely by `nfc_task` (warmed before the poll loop, lazily reloaded
+on first scan, reloaded on every AGENT_START/TEST).
 
-- First scan in `splash_idle` → `orb_refresh_config()` → `convai_start(agent_id)`
-- Re-scan in `running_agent` → `convai_stop()` → `orb_refresh_config()` → `convai_start()` (fresh agent / volume)
+`handle_uid` normalizes the UID to colon-hex (`04:38:17:9A:CB:2A:81`, matching the JSON
+keys) and **looks it up before any UI/tone**, then dispatches:
+
+- `AGENT_START` / `TEST` → reload tags + `orb_refresh_config()` → `convai_stop()` →
+  `convai_start()`. (No splash/temp-WSS state in this firmware, so both mean "reload +
+  restart".)
+- Any other mapped phrase, session running → **inject** `{"type":"user_message","text":
+  "<phrase>"}` into the live WSS via `convai_send_user_message()` — no restart.
+- Mapped phrase, no session (rare) → restart; phrase dropped.
+- **Unmapped UID → ignored** (no tone, no state change).
 
 `orb_refresh_config()` re-runs the Supabase GET and applies new `agent_id`, `agent_name`,
 and `volume` (→ `i2s_audio_set_volume_pct(cfg.volume * 10)`).
 
+**NFC scanning is gated to the idle window** — `orb_ui_set_state()` calls
+`NFC_Set_Polling(s == ORB_MUTED)`, so reads only happen between turns and are suppressed
+during `ORB_USER_TALK` / `ORB_LOADING` / `ORB_AGENT`. This is stricter than BEHAVIOR.md
+§6.4 (which keeps NFC live during the agent response): on this build it's off while the
+agent talks too.
+
 ### Still pending (Stage 4–5 of the original plan)
 
 - [ ] **Init JSON shape per BEHAVIOR.md §2.1**: nest under `agent / tts / asr` keys with `language: "en"` and conditional `tts.volume`. Today we send a flatter shape that the server tolerates.
-- [ ] **NFC tag table**: AGENT_START / TEST (hot reload) / custom-phrase (inject `{"type":"user_message","text":"..."}`). Tag library fetched from URL, NVS cached.
+- [x] **NFC tag table**: AGENT_START / TEST / custom-phrase inject (`{"type":"user_message","text":"..."}`). Tag library **downloaded from GitHub each session** (not URL+NVS-cached as originally specced — no offline fallback by design).
 - [ ] **`did_init` + SUPPRESS_GREETING on reconnect** (BEHAVIOR.md §2.2)
 - [ ] **First-turn barge-in** allowing PTT mid-greeting
-- [ ] **NFC polling disable during user-turn audio capture** (BEHAVIOR.md §6.4)
-- [ ] **TEST tag hot-reload via temp WSS** (BEHAVIOR.md §7)
+- [x] **NFC polling gated to the idle window** (`ORB_MUTED` only) — stricter than BEHAVIOR.md §6.4; suppressed during user-turn capture **and** agent response.
+- [ ] **TEST tag hot-reload via temp WSS** (BEHAVIOR.md §7) — collapsed into "reload + restart" since there's no splash state.
 
 ---
 
@@ -124,7 +142,8 @@ PN532 NFC reader on **J8** I2C header, address `0x24`. DIP switches: SW1=ON, SW2
 - [x] Polling task at 100 ms (was 500 ms — tightened to reduce scan latency)
 - [x] UID normalization + 1.5 s same-UID debounce
 - [x] PN532 not-responding error surfaced via the `errors=N` counter (no LCD scene yet)
-- [x] On tag scan: refresh config from Supabase, start (or restart) convai
+- [x] On tag scan: tag-table lookup → dispatch (AGENT_START/TEST restart · custom-phrase inject · unmapped ignore)
+- [x] Polling gated to `ORB_MUTED` only (off during PTT capture and agent response)
 - [x] Poll heartbeat log silenced once polling was stable — uncomment in `nfc.c` if it regresses
 
 ---
@@ -280,11 +299,11 @@ hardcoded to `192.168.1.27`).
 | Phase 2 — WiFi + SNTP + Supabase config | ✅ done |
 | Phase 2b — ElevenLabs WSS + persistent session | ✅ done (init JSON shape pending) |
 | Phase 2c — App-level send queue (1 MB PSRAM + sender_task) | ✅ done — see [CONVAI.md](CONVAI.md) |
-| Phase 3 — NFC PN532 | ✅ done (tag table pending) |
+| Phase 3 — NFC PN532 | ✅ done |
 | Phase 4 — I2S audio (TX + RX) | ✅ done |
 | Phase 5 — PTT | ✅ done |
 | Phase 5b — Boot-time GitHub OTA + rollback safety | ✅ done — see [DEPLOYMENT.md](DEPLOYMENT.md) / `main/OTA/ota.c` |
-| Phase 6 — NFC tag table (AGENT_START / TEST / custom phrase) | not started |
+| Phase 6 — NFC tag table (AGENT_START / TEST / custom phrase) | ✅ done — GitHub-downloaded table, live-session phrase inject, polling gated to idle. Remaining: TEST-tag temp-WSS greeting (collapsed into restart; no splash state) |
 | Phase 7 — Battery monitoring per BEHAVIOR.md §9 | partial — GPIO4 ADC + 2 s moving average + load-anchored % gauge wired; idle-gating N/A (no idle state); current-sense N/A (no INA219). See [BATTERY.md](BATTERY.md). Remaining: real brown-out `EMPTY` anchor, harness-resistance fix |
 | Phase 8 — Telemetry POST | not started |
 | Phase 9 — Interface polish (this is what we're moving to next) | next |

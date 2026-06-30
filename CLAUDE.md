@@ -71,12 +71,19 @@ Release runbook: [`DEPLOYMENT.md`](DEPLOYMENT.md). Implementation: [`main/OTA/ot
 
 ## NFC
 - Polling interval: 100 ms. Same-UID debounce: 1.5 s.
-- NFC task stack: **8 KB minimum** (`orb_refresh_config()` does an HTTPS GET with TLS handshake)
+- NFC task stack: **8 KB minimum**. The `handle_uid` path can do **two sequential** HTTPS GETs with TLS handshakes — the tag-table download (`orb_nfc_tags_fetch()`) and `orb_refresh_config()`. They run one after another, so peak stack is one handshake at a time; 8 KB holds. Don't drop below it.
+- **Tag table is implemented** (BEHAVIOR.md §6) and **downloaded from GitHub each session** — `NFC_TAGS_URL` in `secrets.h` (raw file on the public OTA repo), fetched via the IDF cert bundle in `config_fetch.c::orb_nfc_tags_fetch()` into a 32 KB PSRAM buffer. **No embed, no NVS cache, no offline fallback** — the orb needs internet to converse at all, so an offline-only table would never run. The parsed `cJSON *s_tags` is owned solely by `nfc_task` (warmed before the poll loop, lazily reloaded on the first scan if the network was late, reloaded on every AGENT_START/TEST), so it needs no lock.
+- **UID format is colon-hex** (`uid_to_hex` emits `04:38:17:9A:CB:2A:81`) to match the JSON keys. This was a real bug: the old formatter emitted colon-less hex, which would miss every lookup. Don't revert it.
+- **Dispatch in `handle_uid`** (lookup happens *before* any UI/tone so unmapped tags are a true no-op):
+  - `AGENT_START` / `TEST` (reserved) → reload tags + `orb_refresh_config()` → restart session (`convai_stop` → `convai_start`). No splash/temp-WSS state exists here, so both reserved tags mean "reload + restart".
+  - Any other mapped phrase, session running → **inject** `{"type":"user_message","text":"<phrase>"}` into the **live** WSS via `convai_send_user_message()` — no teardown, no restart. This is the point of the tag table.
+  - Mapped phrase, session not running (rare) → fall back to restart; phrase dropped.
+  - **Unmapped UID → ignored** (no tone, no state change), per BEHAVIOR.md §6.
+- **NFC scanning is gated to the idle window only.** `orb_ui_set_state()` (`orb_ui.c`) calls `NFC_Set_Polling(s == ORB_MUTED)`, so reads are allowed only between turns and suppressed during `ORB_USER_TALK` (PTT held), `ORB_LOADING` (awaiting agent), and `ORB_AGENT` (agent speaking). This is **stricter than BEHAVIOR.md §6.4**, which keeps NFC live during the agent response — on this build it's off while the agent talks too. `orb_ui_set_state` is the single choke point all modules route transitions through; don't scatter `NFC_Set_Polling` calls elsewhere. The poll loop calls `handle_uid` synchronously, so a scan that sets `ORB_LOADING`/`ORB_AGENT` naturally stops further scanning until `ORB_MUTED` returns.
 - On every tag scan: `orb_refresh_config()` runs first so volume / agent changes from Supabase land without a reboot.
 - Scan UI feedback (`nfc.c::handle_uid`): `orb_ui_set_state(ORB_NFC)` is set **before** the blopp tone so the purple "NFC Scanned" screen is already up while the cue plays. It is held through the TLS config fetch (don't set `ORB_LOADING` early — it would overwrite `ORB_NFC` instantly), then `ORB_LOADING` is set just before `convai_start()` for the WSS-connect phase; the Convai tasks take over from there.
-- Re-scan during running session → `convai_stop()` → `orb_refresh_config()` → `convai_start()` (full restart). `ORB_NFC` stays up across the teardown wait.
+- Re-scan during running session (AGENT_START/TEST) → `convai_stop()` → `orb_refresh_config()` → `convai_start()` (full restart). `ORB_NFC` stays up across the teardown wait.
 - PN532 init failure: surface via the `errors=N` counter in `nfc.c::nfc_task`. (LCD error scene TBD — see PROGRESS.md.)
-- Tag table per BEHAVIOR.md §6 (AGENT_START / TEST / custom-phrase) **not yet implemented** — today any tag is treated as AGENT_START.
 
 ## Audio (I2S)
 - **Split I2S, not duplex**: I2S_NUM_0 TX master + I2S_NUM_1 RX slave on shared BCLK/WS pins. Duplex mode gates clocks when TX is disabled and the mic dies — don't merge them.
