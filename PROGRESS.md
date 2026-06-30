@@ -128,6 +128,7 @@ agent talks too.
 - [ ] **Init JSON shape per BEHAVIOR.md §2.1**: nest under `agent / tts / asr` keys with `language: "en"` and conditional `tts.volume`. Today we send a flatter shape that the server tolerates.
 - [x] **NFC tag table**: AGENT_START / TEST / custom-phrase inject (`{"type":"user_message","text":"..."}`). Tag library **downloaded from GitHub each session** (not URL+NVS-cached as originally specced — no offline fallback by design).
 - [ ] **`did_init` + SUPPRESS_GREETING on reconnect** (BEHAVIOR.md §2.2)
+- [ ] **Conversation resumption on reconnect (`conversation_id`)** — on a WiFi blip the WSS dies and we re-greet, losing context. Capture the `conversation_id` from `conversation_initiation_metadata` and resume instead of starting fresh. Design + open questions in [CONVAI.md](CONVAI.md) "Deferred: resume the conversation on reconnect". Verify ElevenLabs actually supports WSS reattach first.
 - [ ] **First-turn barge-in** allowing PTT mid-greeting
 - [x] **NFC polling gated to the idle window** (`ORB_MUTED` only) — stricter than BEHAVIOR.md §6.4; suppressed during user-turn capture **and** agent response.
 - [ ] **TEST tag hot-reload via temp WSS** (BEHAVIOR.md §7) — collapsed into "reload + restart" since there's no splash state.

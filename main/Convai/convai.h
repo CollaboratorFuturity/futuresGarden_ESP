@@ -16,10 +16,12 @@ void convai_stop(void);
 bool convai_is_running(void);
 
 // Inject a text turn into the live conversation, e.g. from a custom-phrase NFC
-// tag. Builds {"type":"user_message","text":"<text>"} and sends it directly
-// over the WSS (bypassing the mic queue, like the other one-shot events). The
-// agent treats it as a complete user utterance and responds. No-op (returns
-// false) if no conversation is running or the WS is down.
+// tag. Builds {"type":"user_message","text":"<text>"} and sends it directly over
+// the WSS (bypassing the mic queue, like the other one-shot events), THEN appends
+// a tail-silence pad to force the turn to end — without it the server's audio-VAD
+// turn detection never sees an end-of-turn and the agent stays silent. The agent
+// then treats the text as a complete user utterance and responds. No-op (returns
+// false) if no conversation is running, the WS is down, or PTT is held.
 bool convai_send_user_message(const char *text);
 
 // Push-to-talk. Call with true on button press (starts streaming the mic

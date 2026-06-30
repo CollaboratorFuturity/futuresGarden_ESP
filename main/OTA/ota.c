@@ -162,6 +162,21 @@ void orb_ota_check_and_update_on_boot(void)
     const char *running_ver    = app ? app->version : "?";
     ESP_LOGI(TAG, "running version: %s", running_ver);
 
+    // Dev-build guard. A clean release is built at an exact tag, so its
+    // git-describe version is just the tag (e.g. "v0.0.1"). A local/dev build
+    // carries extra suffixes — "-<N>-g<hash>" (commits ahead of the tag) and/or
+    // "-dirty" (uncommitted changes), or "NOTAG" when no tag exists. Because the
+    // update test below is a plain strcmp (any difference triggers a download),
+    // auto-updating a dev build would pull the device back DOWN to whatever the
+    // latest published release is — clobbering the local work you just flashed.
+    // So skip the OTA check entirely for non-release builds; only clean tagged
+    // images participate in auto-update.
+    if (strstr(running_ver, "-dirty") || strstr(running_ver, "-g") ||
+        strstr(running_ver, "NOTAG")) {
+        ESP_LOGW(TAG, "dev build (%s) — skipping OTA auto-update", running_ver);
+        return;
+    }
+
     char latest_tag[64]    = {0};
     char asset_url[256]    = {0};
     if (!fetch_latest_release(latest_tag, sizeof(latest_tag),
@@ -186,6 +201,14 @@ void orb_ota_check_and_update_on_boot(void)
         .timeout_ms        = 30000,
         .keep_alive_enable = true,
         .user_agent        = "orb-esp32/ota",
+        // GitHub release downloads 302-redirect from github.com to a signed
+        // objects.githubusercontent.com URL whose query string is 600-900+
+        // chars. The default 512 B TX buffer can't hold that request line and
+        // esp_http_client aborts with "Out of buffer" before the GET is sent.
+        // Bump both buffers so the redirected request + its response headers
+        // fit. (RX bumped too — the signed-URL host returns large headers.)
+        .buffer_size       = 4096,
+        .buffer_size_tx    = 4096,
     };
     esp_https_ota_config_t ota_cfg = {
         .http_config = &http_cfg,

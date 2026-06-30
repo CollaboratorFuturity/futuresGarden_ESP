@@ -1183,6 +1183,13 @@ void convai_stop(void)
 bool convai_send_user_message(const char *text)
 {
     if (!s_running || !s_ws || !text || !text[0]) return false;
+    if (s_ptt_held) {
+        // Must not interleave with a live mic capture (shares s_mic_pcm with the
+        // silence pad below). NFC only scans while muted so this shouldn't fire,
+        // but guard anyway.
+        ESP_LOGW(TAG, "user_message skipped: PTT held");
+        return false;
+    }
 
     // Build {"type":"user_message","text":"<text>"} with cJSON so the phrase is
     // correctly JSON-escaped (it can contain quotes/UTF-8).
@@ -1200,7 +1207,19 @@ bool convai_send_user_message(const char *text)
     if (n > 0) { s_last_tx_us = esp_timer_get_time(); s_tx_bytes_total += n; }
     ESP_LOGI(TAG, "user_message injected (rc=%d): \"%s\"", n, text);
     free(payload);
-    return n > 0;
+    if (n <= 0) return false;
+
+    // Force the user turn to end so the agent actually responds. The session
+    // uses server-side VAD turn detection on the *audio* stream
+    // (turn_detection.silence_duration_ms in send_initiation), so a text-only
+    // user_message gives the server no end-of-turn and the agent stays silent
+    // (symptom: stuck on ORB_LOADING). Append the same tail-silence pad a PTT
+    // release sends — BEHAVIOR.md §6.2 / §3.5 "force_turn_end" — so the VAD
+    // closes the turn. Also arm the stale-turn watchdog like the PTT path does.
+    s_ptt_close_us = esp_timer_get_time();
+    s_stale_warned = false;
+    send_silence_frames(PTT_TAIL_SILENCE_FRAMES);
+    return true;
 }
 
 bool convai_is_running(void)

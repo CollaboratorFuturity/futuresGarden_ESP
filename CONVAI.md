@@ -229,6 +229,7 @@ Key properties:
 | `pong` reply | **No** (direct) | Infrequent (1-2/s) and intentionally skipped during PTT — would never drive fail-fast |
 | `user_activity` keepalive | **No** (direct) | 1/60 s, too infrequent to matter |
 | `conversation_initiation_client_data` | **No** (direct) | One-shot at WS connect; must succeed before any mic frame is meaningful |
+| `user_message` (NFC custom phrase) | **No** (direct) | One-shot per tag scan; its turn-end silence pad that follows IS queued. See "Text injection" below |
 
 ---
 
@@ -355,6 +356,53 @@ the pad without lowering the server threshold to match.
 
 ---
 
+## Text injection — `convai_send_user_message` (NFC custom-phrase tags)
+
+A custom-phrase NFC tag (BEHAVIOR.md §6) drops a line of text into the **live**
+conversation as if the user had spoken it — no session restart. `nfc.c::handle_uid`
+calls `convai_send_user_message(phrase)`; the agent answers and the session
+continues. This is the one place we feed the agent user input that isn't mic audio.
+
+**It is a two-part send, and both parts are mandatory:**
+
+1. **The text event** — `{"type":"user_message","text":"<phrase>"}`, built with cJSON
+   (so quotes / UTF-8 are escaped) and **direct-sent** (not via the mic queue), same
+   class as `pong` / `user_activity` / `send_initiation`. One-shot, too infrequent to
+   drive the lib's fail-fast.
+2. **A turn-end pad** — immediately after the text we push `PTT_TAIL_SILENCE_FRAMES`
+   of zero audio through the queue (the same pad a PTT release sends).
+
+**Why part 2 is not optional (the bug we hit and fixed):** the session runs
+**server-side VAD turn detection on the audio stream** (`turn_detection.silence_duration_ms`).
+The server decides "user is done → agent's turn" by hearing audio go silent. A
+text-only `user_message` carries no audio, so the server registers the text but never
+sees an end-of-turn — the agent stays silent forever and the UI sticks on `ORB_LOADING`.
+The silence pad is the **ESP32 realization of the Pi's `force_turn_end`** (BEHAVIOR.md
+§3.5). Unlike the Pi — which only force-ended when a tag was scanned *mid-press* — we
+fire it unconditionally, because NFC only scans while PTT is idle (§6.4 gating) so there
+is otherwise no audio turn boundary at all.
+
+**Healthy trace** (from a verified run):
+```
+custom phrase -> inject "tell me about your backpack"
+user_message injected (rc=60)
+sender: sent #33 (item=1303B ...)     ← the silence pad going out
+rx: type=audio ... (×N)               ← agent responds
+agent: This is my bag, yeah. ...
+```
+If you instead see `user_message injected` followed by **only pings** (`rx_2s` stays at
+ping size, no `audio`/`agent_response`), the turn-end didn't land — check that the pad is
+still being sent.
+
+**Guards / ownership:** `convai_send_user_message` returns false (no-op) if the WS is
+down, no session is running, or `s_ptt_held` is true. The PTT guard matters because the
+pad reuses `s_mic_pcm` via `send_silence_frames`, which `mic_task` also owns during a
+press; the §6.4 NFC gate (scan only in `ORB_MUTED`) already guarantees PTT is idle, but
+the guard is belt-and-suspenders. The call blocks ~1.29 s (the pad is paced at 30 ms/frame)
+in `nfc_task`, which is fine — NFC polling is suppressed during `ORB_LOADING` anyway.
+
+---
+
 ## Heartbeat — the diagnostic surface
 
 Every 2 s, `heartbeat_task` emits one long line. While `s_log_verbose`
@@ -444,6 +492,46 @@ When things go wrong, in order:
 
 ---
 
+## Deferred: resume the conversation on reconnect (`conversation_id`)
+
+**Status: not implemented — design note for later.**
+
+**Problem.** A WiFi blip / `ECONNRESET` / STA reassoc kills the stateful WSS. On
+reconnect the lib re-runs `send_initiation`, which the server treats as a brand-new
+conversation → the agent re-greets and all prior context (who the user is, what was
+discussed) is gone. Seen live: WiFi dropped, the orb pulled a fresh DHCP lease, and
+the conversation restarted from the greeting.
+
+**Idea.** ElevenLabs assigns a `conversation_id`, delivered in the
+`conversation_initiation_metadata` event we currently only **log** (`convai.c`
+`process_message`, the `conversation_initiation_metadata` branch — we don't parse it).
+If the API supports reattaching to an existing conversation, capture that id and, on a
+*transport reconnect* (not a deliberate restart), resume it instead of re-greeting.
+
+**To pick up, in order:**
+1. **Verify the API first — load-bearing unknown.** Confirm whether ElevenLabs ConvAI
+   supports resuming a conversation over a *new* WSS, and the exact mechanism (likely a
+   query param e.g. `&conversation_id=<id>` on the WS URL, or a field inside
+   `conversation_initiation_client_data`). If it's unsupported, the rest is moot — don't
+   build on an assumption. Check the ElevenLabs agents/WSS docs.
+2. **Capture the id.** In the `conversation_initiation_metadata` branch, pull
+   `conversation_initiation_metadata_event.conversation_id` into a static
+   (`s_conversation_id`).
+3. **Distinguish reconnect from restart.** Only resume on a transport-level reconnect
+   (`WEBSOCKET_EVENT_DISCONNECTED` → auto-reconnect). A deliberate NFC `AGENT_START`/`TEST`
+   (`convai_stop()` → `convai_start()`) must still start **fresh** — clear
+   `s_conversation_id` in `convai_stop()`.
+4. **Resume in `send_initiation`.** If `s_conversation_id` is set, send the resume variant
+   **and** suppress the greeting (this is the same machinery as the still-pending
+   `did_init` / `SUPPRESS_GREETING`, BEHAVIOR.md §2.2). Otherwise send the normal
+   fresh-greeting init.
+5. **Always have a fallback.** The server times conversations out (our URL sets
+   `inactivity_timeout=120`). If resume fails (expired/unknown id), fall back to a fresh
+   `send_initiation` — never hang waiting on a dead id.
+
+**Related:** `did_init` + `SUPPRESS_GREETING` (BEHAVIOR.md §2.2, PROGRESS.md pending) —
+both are "a reconnect within a session shouldn't re-greet."
+
 ## Things not in this doc that might bite you
 
 - **The legacy Pi** ([futuresGarden/main.py](futuresGarden/main.py))
@@ -451,10 +539,10 @@ When things go wrong, in order:
   Worth re-reading if a new failure mode appears.
 - **The send queue does not solve ECONNRESET or WiFi reassoc.** Those
   are real disconnects; the WS dies and on reconnect we re-greet.
-  Detecting that case and showing the user something (instead of the
-  greeting) is a separate, intentionally-unimplemented decision —
-  see the "What's next" discussion in conversation history if you
-  pick it up.
+  Resuming the conversation instead of re-greeting is scoped in
+  **"Deferred: resume the conversation on reconnect (`conversation_id`)"**
+  above. Detecting the case and showing the user something is the
+  lighter-weight alternative if full resume isn't supported.
 - **HW AES is off.** TLS throughput is ~half what it could be. If
   you ever need to crank network volume (multiple simultaneous WSS,
   larger audio rates), HW AES + careful DMA placement is the lever.

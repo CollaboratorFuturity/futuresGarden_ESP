@@ -114,7 +114,9 @@ On NFC tag scan (only fires in ORB_MUTED — polling is gated to the idle window
 
   if phrase not in {AGENT_START, TEST} and convai_is_running():
     orb_ui_set_state(ORB_LOADING)
-    convai_send_user_message(phrase)                         # inject into LIVE session, no restart
+    convai_send_user_message(phrase)                         # inject into LIVE session, no restart;
+                                                             #   sends user_message THEN a silence pad to
+                                                             #   force turn-end, else the agent never replies
     return
   # AGENT_START / TEST (or phrase with no live session): reload + restart
   nfc_tags_reload()
