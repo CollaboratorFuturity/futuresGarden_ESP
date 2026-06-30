@@ -246,6 +246,89 @@ anything before it fails, no orb has tried to update yet — recovery is local.
 
 ---
 
+## Testing OTA on a dev build — the dev-guard toggle
+
+OTA normally **skips dev builds** (versions containing `-g`/`-dirty`/`NOTAG`) so a
+locally flashed image is never auto-downgraded to the latest release. To verify the
+OTA path itself on a bench orb, disable that guard:
+
+- Kconfig `CONFIG_ORB_OTA_UPDATE_DEV_BUILDS` (`main/Kconfig.projbuild`), default `n`.
+- Enable via `idf.py menuconfig` → *Example Configuration* → *Allow OTA auto-update on
+  dev builds*. It lands in the **gitignored `sdkconfig`** — never put it in
+  `sdkconfig.defaults`, so it can't leak into a release.
+- With it on, a dev image logs `dev-guard DISABLED …` and takes OTA like a release.
+- **No-op for clean tagged releases** (their version has no `-g`/`-dirty`/`NOTAG`), so
+  the toggle only ever affects dev images on your bench.
+
+Test flow: **publish the target release first.** OTA triggers on any version
+*difference*, not "newer" — a guard-off dev build grabs whatever is *latest*, even an
+older tag. Then flash the guard-off dev build, power-cycle, and watch the `ota:` lines
+over UDP (`nc -ul 6666`). Turn the toggle back off for normal dev so your dev flashes
+stay put.
+
+---
+
+## Per-orb identity & provisioning (NVS `device_id`)
+
+Each orb fetches its Supabase config keyed on a `device_id`. **Identity lives in NVS,
+not the firmware image** (`main/Wireless/config_fetch.c::orb_device_id`) — OTA ships
+ONE binary to every orb, so a baked-in id would repaint the whole fleet on update.
+
+Resolution order in `orb_device_id()`:
+1. `DEVICE_ID` set **and** `DEVICE_ID_OVERWRITE=1` → force-rewrite NVS from the
+   compile-time id (deliberate re-provision; **never ship a release with this `=1`**).
+2. NVS holds a `device_id` → use it. The normal, OTA-safe path.
+3. NVS empty → seed once from `DEVICE_ID` (or a `orb-XXXXXX` MAC id if undefined),
+   persist, use it.
+
+So `DEVICE_ID` in `secrets.h` is a **one-time provisioning seed**, not the live id.
+
+**Provision a new orb (one cable flash each, all from a clean release tag):**
+1. Set `#define DEVICE_ID "<color>"` in `secrets.h`, build, cable-flash.
+2. First boot logs `device_id=<color> (seeded into NVS on first boot)` and stamps NVS.
+   The orb keeps that id across all future OTA updates.
+3. `secrets.h` is gitignored, so swapping the color between orbs doesn't change the
+   version — every provisioning build reports the same clean tag, so all orbs stay on
+   the OTA track. (Provision from a *release tag*, not a dev build — the dev-guard
+   would take those orbs off the OTA track.)
+
+**Published release assets MUST be neutral.** Build the binary you upload to GitHub with
+`DEVICE_ID` **commented out**, so any unprovisioned orb that auto-pulls it seeds a
+harmless MAC id instead of a color. Verify: `strings build/…bin | grep -iE
+'^(black|purple|…)$'` → expect no match.
+
+**Re-provision** an orb to a new color: either `idf.py erase-flash` (wipes NVS → next
+boot re-seeds from `DEVICE_ID`) then flash, or set `DEVICE_ID_OVERWRITE 1` for a
+no-erase rewrite (flash once, set back to `0`).
+
+**Migration trap**: you can't roll identity out via one shared OTA release — every
+unprovisioned orb would seed from that release's baked id at once. Provision each orb by
+cable (or accept MAC ids and map them in Supabase). A live orb already on the OTA track
+auto-pulls a new neutral release and seeds a MAC id, losing its friendly config until
+you cable-provision it — do so promptly (or `erase-flash` + reflash if it beat you).
+
+---
+
+## Changing WiFi (or any `secrets.h` value) via OTA
+
+WiFi creds are compile-time (`secrets.h` → `esp_wifi_set_config`), so changing them = a
+new binary. Over OTA this works **only if the orb can still reach the internet on its
+*current* creds** to download the release that carries the new ones:
+- Old network still reachable → safe over OTA (rollback covers a bad switch *if the old
+  network stays up*).
+- Old network going away → **cable flash**; once the orb can't connect there's no path to
+  deliver the fix.
+
+Hand-flashed `secrets.h` changes (WiFi, `device_id`, etc.) **stick across OTA only if the
+flashed build reports the same version as the latest release** — OTA compares version
+*strings* (`strcmp`), so a build still reading `vX.Y.Z` is "up to date" and won't
+re-download. `secrets.h` is gitignored, so editing it keeps the tree clean and the version
+unchanged. Build from the release tag and confirm with
+`strings build/…elf | grep -Fx vX.Y.Z` before flashing. A build that reads any other
+version would OTA back to the release binary on next boot, discarding your local change.
+
+---
+
 ## Notes for me (Claude) when running this
 
 - This runbook does NOT flash the device. The user does that separately if
