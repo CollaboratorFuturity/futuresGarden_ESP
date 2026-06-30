@@ -40,7 +40,7 @@ typedef struct {
 static const OrbStateStyle STATE_STYLE[] = {
     [ORB_BOOT]      = { 0x404040, "Booting" },
     [ORB_WIFI]      = { 0x404040, "Connecting\nWiFi" },
-    [ORB_CONFIG]    = { 0x404040, "Fetching\nconfig\n(v1)" },
+    [ORB_CONFIG]    = { 0x404040, "Fetching\nconfig\n(v2)" },
     [ORB_CHECK_UPD] = { 0x404040, "Checking\nfor updates" },
     [ORB_UPDATING]  = { 0x404040, "Updating" },
     [ORB_WIFI_FAIL] = { 0xC0392B, "No WiFi. Check\nrouter & restart" },
