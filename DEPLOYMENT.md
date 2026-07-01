@@ -311,13 +311,21 @@ you cable-provision it — do so promptly (or `erase-flash` + reflash if it beat
 
 ## Changing WiFi (or any `secrets.h` value) via OTA
 
-WiFi creds are compile-time (`secrets.h` → `esp_wifi_set_config`), so changing them = a
-new binary. Over OTA this works **only if the orb can still reach the internet on its
-*current* creds** to download the release that carries the new ones:
-- Old network still reachable → safe over OTA (rollback covers a bad switch *if the old
-  network stays up*).
-- Old network going away → **cable flash**; once the orb can't connect there's no path to
-  deliver the fix.
+WiFi networks are a compile-time **priority list** — `WIFI_CREDS` in `secrets.h`, applied
+by `wifi_connect_best()` in `main/Wireless/Wireless.c` (scans on boot + each disconnect,
+connects to the first listed network in range). So changing/adding networks = a new
+binary. Over OTA this works **only if the orb can still reach the internet on a network
+it *currently* has listed** to download the release that carries the new list:
+- At least one already-listed network still reachable → safe over OTA (rollback covers a
+  bad switch *if that network stays up*). The multi-network list makes this easier: any
+  one of the listed APs being up is enough to deliver the update.
+- None of the currently-listed networks reachable → **cable flash**; there's no path to
+  deliver the fix once the orb can't connect to anything it knows.
+
+Practical rollout for a network change: add the NEW network to `WIFI_CREDS` *alongside*
+the old one, cut a release, let every orb OTA over the old network, confirm they're
+online, then retire the old network (and optionally drop it from the list in a later
+release). Because the orb tries the whole list, the switch is seamless.
 
 Hand-flashed `secrets.h` changes (WiFi, `device_id`, etc.) **stick across OTA only if the
 flashed build reports the same version as the latest release** — OTA compares version

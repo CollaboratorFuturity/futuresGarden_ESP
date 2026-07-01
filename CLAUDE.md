@@ -80,6 +80,13 @@ Each orb fetches its Supabase config keyed on a `device_id`. **The id lives in N
 - **Re-provision** a stamped orb with `idf.py erase-flash` (wipes NVS → re-seeds) or `DEVICE_ID_OVERWRITE 1` (no-erase rewrite; never ship a release with it =1).
 - **Migration trap**: you can't roll identity out via one shared OTA release — every unprovisioned orb would seed from that release's baked id at once. Provision by cable. A live orb already on the OTA track auto-pulls a new neutral release and seeds a MAC id, losing its friendly config until cable-provisioned.
 
+## WiFi — multi-network, connect to first in-range
+- **Networks come from a priority LIST, not a single SSID.** `secrets.h` defines `WIFI_CREDS` — an array of `{ "ssid", "password" }` in priority order (top = highest). The old `WIFI_SELECT` single-pick macro is gone; don't reintroduce it.
+- **`wifi_connect_best()` (`main/Wireless/Wireless.c`)** scans on `STA_START` and after every `STA_DISCONNECTED`, then associates to the **first listed network that's actually in range**. `WIFI_Init` only starts STA now — per-network `esp_wifi_set_config` happens in `wifi_connect_best()`, not at init. Don't move config back into `WIFI_Init`.
+- **Selection is list-order priority, not signal strength.** Among visible networks the highest in the list wins. (RSSI preference would be a one-line change on `recs[r].rssi`.)
+- **Failure handling**: an absent network is skipped instantly (scan-based, no timeout). A network that's present but rejects auth (wrong password: reason 202/15/204/200) is flagged in `s_auth_failed[]` and skipped for the rest of the boot so it can't loop; if *every* cred auth-fails the flags reset rather than lock the orb out. `NO_AP_FOUND` (201) is just out-of-range and stays eligible for the next scan.
+- **Roaming implication**: an orb moves between any listed networks with no reflash. Adding/removing networks for the fleet is a compile-time change → new release (creds are baked from the gitignored `secrets.h`). WiFi-change-over-OTA rules + rollout in [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## NFC
 - Polling interval: 100 ms. Same-UID debounce: 1.5 s.
 - NFC task stack: **8 KB minimum**. The `handle_uid` path can do **two sequential** HTTPS GETs with TLS handshakes — the tag-table download (`orb_nfc_tags_fetch()`) and `orb_refresh_config()`. They run one after another, so peak stack is one handshake at a time; 8 KB holds. Don't drop below it.
