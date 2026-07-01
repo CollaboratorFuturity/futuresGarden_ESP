@@ -1,5 +1,7 @@
 #include "Wireless.h"
 
+#include <string.h>
+
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "orb_ui.h"
@@ -19,6 +21,16 @@ bool BLE_Scan_Finish = 0;
 bool WiFi_Connected = false;
 
 static const char *WIFI_TAG = "orb-wifi";
+
+// ---- WiFi network list (priority order, top = highest) ----
+// Defined in secrets.h as WIFI_CREDS. On boot (and after every disconnect) the
+// orb scans and connects to the first listed network it can actually see, so a
+// missing AP never blocks the boot and switching networks needs no reflash.
+typedef struct { const char *ssid; const char *pass; } wifi_cred_t;
+static const wifi_cred_t s_creds[] = WIFI_CREDS;
+static const size_t s_ncreds = sizeof(s_creds) / sizeof(s_creds[0]);
+static int  s_cur_cred = -1;                                  // index being attempted
+static bool s_auth_failed[sizeof(s_creds) / sizeof(s_creds[0])] = { false };  // skip this boot (bad pw)
 
 // Cache of the fetched agent identity, exposed via orb_get_agent_id/name.
 // Populated once by post_connect_task after orb_config_fetch returns.
@@ -87,21 +99,92 @@ static void post_connect_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// Scan, then associate to the highest-priority configured network that is in
+// range and hasn't failed auth this boot. Single-shot: if none of our networks
+// are visible it still attempts the top eligible cred, so the resulting
+// NO_AP_FOUND disconnect drives another scan+retry via wifi_event_handler.
+// Blocking scan — consistent with the existing blocking retry in that handler.
+static void wifi_connect_best(void)
+{
+    wifi_scan_config_t scan = { .show_hidden = false };
+    if (esp_wifi_scan_start(&scan, true) != ESP_OK) {
+        ESP_LOGW(WIFI_TAG, "scan start failed");
+    }
+
+    uint16_t found = 0;
+    esp_wifi_scan_get_ap_num(&found);
+    if (found > 20) found = 20;                 // cap the records we pull
+    wifi_ap_record_t recs[20];
+    if (found) esp_wifi_scan_get_ap_records(&found, recs);
+
+    // Pick the first listed cred that is visible and not auth-failed.
+    int chosen = -1;
+    for (size_t c = 0; c < s_ncreds && chosen < 0; c++) {
+        if (s_auth_failed[c]) continue;
+        for (uint16_t r = 0; r < found; r++) {
+            if (strcmp(s_creds[c].ssid, (const char *)recs[r].ssid) == 0) {
+                chosen = (int)c;
+                break;
+            }
+        }
+    }
+
+    if (chosen >= 0) {
+        ESP_LOGI(WIFI_TAG, "selected \"%s\" (priority %d of %u, %u APs seen)",
+                 s_creds[chosen].ssid, chosen, (unsigned)s_ncreds, found);
+    } else {
+        // None in range. Fall back to the top eligible cred so a NO_AP_FOUND
+        // disconnect re-drives the scan loop. If every cred has auth-failed,
+        // clear the flags and start over rather than lock the orb out.
+        for (size_t c = 0; c < s_ncreds; c++) if (!s_auth_failed[c]) { chosen = (int)c; break; }
+        if (chosen < 0) {
+            for (size_t c = 0; c < s_ncreds; c++) s_auth_failed[c] = false;
+            chosen = 0;
+        }
+        ESP_LOGW(WIFI_TAG, "no configured network in range (%u APs); retrying via \"%s\"",
+                 found, s_creds[chosen].ssid);
+    }
+
+    s_cur_cred = chosen;
+    wifi_config_t wcfg = {0};
+    strncpy((char *)wcfg.sta.ssid,     s_creds[chosen].ssid, sizeof(wcfg.sta.ssid) - 1);
+    strncpy((char *)wcfg.sta.password, s_creds[chosen].pass, sizeof(wcfg.sta.password) - 1);
+    // Accept open..WPA3 (WPA3-only routers reject the stricter WPA2 threshold).
+    wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    wcfg.sta.pmf_cfg.capable  = true;
+    wcfg.sta.pmf_cfg.required = false;
+    esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+    esp_wifi_connect();
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         orb_ui_set_state(ORB_WIFI);
-        esp_wifi_connect();
+        wifi_connect_best();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         WiFi_Connected = false;
         orb_ui_set_state(ORB_WIFI);
         wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)data;
-        // reason codes: 201=NO_AP_FOUND (wrong SSID / 5GHz-only), 202=AUTH_FAIL
-        // (wrong password), 15=4WAY_HANDSHAKE_TIMEOUT (also usually wrong PW),
-        // 204=HANDSHAKE_TIMEOUT, 200=AUTH_EXPIRE.
-        ESP_LOGW(WIFI_TAG, "disconnected reason=%d, retrying", ev ? ev->reason : -1);
+        uint8_t reason = ev ? ev->reason : 0;
+        // reason codes: 201=NO_AP_FOUND (out of range / wrong SSID / 5GHz-only),
+        // 202=AUTH_FAIL (wrong password), 15=4WAY_HANDSHAKE_TIMEOUT (also usually
+        // wrong PW), 204=HANDSHAKE_TIMEOUT, 200=AUTH_EXPIRE.
+        ESP_LOGW(WIFI_TAG, "disconnected reason=%d (cred %d), rescanning", reason, s_cur_cred);
+        // A wrong-password / handshake failure means this network is present but
+        // unusable — skip it for the rest of the boot so we don't loop on it.
+        // NO_AP_FOUND is just out-of-range; keep it eligible for the next scan.
+        if (s_cur_cred >= 0 &&
+            (reason == WIFI_REASON_AUTH_FAIL ||
+             reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+             reason == WIFI_REASON_HANDSHAKE_TIMEOUT ||
+             reason == WIFI_REASON_AUTH_EXPIRE)) {
+            s_auth_failed[s_cur_cred] = true;
+            ESP_LOGW(WIFI_TAG, "auth failed for \"%s\"; skipping it this boot",
+                     s_creds[s_cur_cred].ssid);
+        }
         vTaskDelay(pdMS_TO_TICKS(2000));
-        esp_wifi_connect();
+        wifi_connect_best();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(WIFI_TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
@@ -156,17 +239,9 @@ void WIFI_Init(void *arg)
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
 
-    wifi_config_t wcfg = {0};
-    strncpy((char *)wcfg.sta.ssid, WIFI_SSID, sizeof(wcfg.sta.ssid) - 1);
-    strncpy((char *)wcfg.sta.password, WIFI_PASSWORD, sizeof(wcfg.sta.password) - 1);
-    // Accept anything from open to WPA3 — WPA3-only routers (Eero 6+, modern
-    // ASUS/Netgear) reject the stricter WIFI_AUTH_WPA2_PSK threshold.
-    wcfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    wcfg.sta.pmf_cfg.capable  = true;
-    wcfg.sta.pmf_cfg.required = false;
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
+    // Per-network config is applied later in wifi_connect_best() (on STA_START),
+    // after a scan picks the highest-priority network actually in range.
     ESP_ERROR_CHECK(esp_wifi_start());
 
     vTaskDelete(NULL);
