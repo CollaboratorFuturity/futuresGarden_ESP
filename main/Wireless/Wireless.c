@@ -1,6 +1,7 @@
 #include "Wireless.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -31,6 +32,7 @@ static const wifi_cred_t s_creds[] = WIFI_CREDS;
 static const size_t s_ncreds = sizeof(s_creds) / sizeof(s_creds[0]);
 static int  s_cur_cred = -1;                                  // index being attempted
 static bool s_auth_failed[sizeof(s_creds) / sizeof(s_creds[0])] = { false };  // skip this boot (bad pw)
+static TaskHandle_t s_wifi_mgr = NULL;                        // runs scan+select off the event task
 
 // Cache of the fetched agent identity, exposed via orb_get_agent_id/name.
 // Populated once by post_connect_task after orb_config_fetch returns.
@@ -114,8 +116,12 @@ static void wifi_connect_best(void)
     uint16_t found = 0;
     esp_wifi_scan_get_ap_num(&found);
     if (found > 20) found = 20;                 // cap the records we pull
-    wifi_ap_record_t recs[20];
-    if (found) esp_wifi_scan_get_ap_records(&found, recs);
+    // Heap, NOT stack: wifi_ap_record_t is ~80 B, so recs[20] is ~1.6 KB — far
+    // too big for the caller's task stack. (This ran on the 2.3 KB event task
+    // originally and silently overflowed it → boot loop.)
+    wifi_ap_record_t *recs = found ? calloc(found, sizeof(*recs)) : NULL;
+    if (recs) esp_wifi_scan_get_ap_records(&found, recs);
+    else      found = 0;
 
     // Pick the first listed cred that is visible and not auth-failed.
     int chosen = -1;
@@ -128,6 +134,7 @@ static void wifi_connect_best(void)
             }
         }
     }
+    free(recs);
 
     if (chosen >= 0) {
         ESP_LOGI(WIFI_TAG, "selected \"%s\" (priority %d of %u, %u APs seen)",
@@ -157,11 +164,23 @@ static void wifi_connect_best(void)
     esp_wifi_connect();
 }
 
+// Runs the blocking scan+select off the tiny (~2.3 KB) WiFi event-handler task,
+// which cannot afford it. The event handler only nudges this task; a short
+// settle delay keeps a reconnect storm from hammering the radio.
+static void wifi_manager_task(void *arg)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);   // wait for a (re)connect nudge
+        vTaskDelay(pdMS_TO_TICKS(500));            // let disconnect churn settle
+        wifi_connect_best();
+    }
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         orb_ui_set_state(ORB_WIFI);
-        wifi_connect_best();
+        xTaskNotifyGive(s_wifi_mgr);            // scan+connect runs on wifi_mgr task
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         WiFi_Connected = false;
         orb_ui_set_state(ORB_WIFI);
@@ -183,8 +202,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             ESP_LOGW(WIFI_TAG, "auth failed for \"%s\"; skipping it this boot",
                      s_creds[s_cur_cred].ssid);
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        wifi_connect_best();
+        xTaskNotifyGive(s_wifi_mgr);            // re-scan+connect on wifi_mgr task
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(WIFI_TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
@@ -240,8 +258,14 @@ void WIFI_Init(void *arg)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
     // Per-network config is applied later in wifi_connect_best() (on STA_START),
-    // after a scan picks the highest-priority network actually in range.
+    // after a scan picks the highest-priority network actually in range. That
+    // runs on this dedicated 4 KB task — NOT the ~2.3 KB event-handler task,
+    // which the scan-results buffer overflows. Must exist before esp_wifi_start()
+    // so the STA_START nudge lands.
+    xTaskCreatePinnedToCore(wifi_manager_task, "wifi_mgr", 4096, NULL, 3, &s_wifi_mgr, 0);
+
     ESP_ERROR_CHECK(esp_wifi_start());
 
     vTaskDelete(NULL);
