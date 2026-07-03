@@ -206,7 +206,7 @@ hb: ws=up rx_age=4ms tx_age=989ms rx_2s=73662B last=agent_chat_response_part
 | `last=` | type of last server message | `ping` between turns, `audio`/`agent_response` during reply |
 | `lvgl_d` | LVGL task iterations in last 2 s — proves screen isn't frozen | > 1000 |
 | `ptt=0/1` | PTT button currently held? | matches button state |
-| `heap_int=NK` | free internal SRAM | > 4 KB; tightens during PTT |
+| `heap_int=NK` | free internal SRAM (the scarce resource) | should stay healthy through agent audio now that cJSON/lwIP/stacks are in PSRAM; if it craters toward 0 during a turn, a hot alloc leaked back to internal SRAM — see [CLAUDE.md](CLAUDE.md) "Memory" |
 | `psram=NK` | free PSRAM | plenty (we have 4+ MB free) |
 | `conn#N disc#N` | cumulative WS connect / disconnect counts | `conn#1 disc#0` for a healthy session |
 | `pings=N pongs=N` | cumulative server pings received / pongs we sent | should track each other |
@@ -333,6 +333,6 @@ Managed components are pulled via [`main/idf_component.yml`](main/idf_component.
 4. **WSS task stack ≥ 8 KB** — cJSON + mbedTLS + base64 decode overflow the 4 KB default.
 5. **NFC task stack ≥ 8 KB** — `handle_uid` can do two sequential HTTPS GETs with TLS (tag-table download + `orb_refresh_config()`); the 4 KB default overflows. They run one at a time, so 8 KB holds.
 6. **Pin TLS roots per host** — the built-in CA bundle didn't match either Supabase or ElevenLabs reliably on our build. We embed `gts_root_r4.pem` (Supabase) and `gts_root_r1.pem` (ElevenLabs).
-7. **WSS audio events are huge** — single events for short greetings have been seen at 250+ KB. The reassembly buffer is 2 MB PSRAM. Decode in 1 KB chunks with `portMAX_DELAY` backpressure so the PCM ring (128 KB) doesn't have to hold a whole turn.
+7. **WSS audio events are huge** — single events for short greetings have been seen at 250+ KB. The reassembly buffer is 2 MB PSRAM. Decode in 1 KB chunks with `portMAX_DELAY` backpressure. The **PCM ring is 512 KB PSRAM** (was 128 KB) — sized to hold ~a whole turn so the WS task doesn't block mid-turn and starve WiFi RX (`wifi:m f null`). Internal SRAM is the scarce resource; keep big/frequent allocs in PSRAM — full story in [CLAUDE.md](CLAUDE.md) "Memory".
 8. **DOUT mute (not channel-disable)** to silence the speaker during recording — TX channel must stay enabled or the mic loses BCLK/WS.
 9. **Battery ADC reads *board* voltage, not cell** — it senses after the power switch + harness, so it's load-dependently ~20–190 mV below the cell. Gauge constants are anchored to that post-drop reading, not cell voltage. See [BATTERY.md](BATTERY.md). Don't re-add idle-gated sampling — there's no idle state.

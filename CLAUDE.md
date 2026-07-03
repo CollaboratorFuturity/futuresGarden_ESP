@@ -18,6 +18,14 @@ Live constants in `main/Convai/convai.c`:
 - Short-turn skip: real audio **< 800 ms** → treated same as silent revert (`PTT_SHORT_TURN_MIN_MS`)
 - Button debounce: **50 ms** (`main/Button/button.c::DEBOUNCE_MS`)
 
+### Stale-turn recovery (the fix for "release PTT, stuck on ORB_LOADING forever")
+The server occasionally **misses the end-of-turn** — it receives the full turn (mic frames + tail pad, queue healthy: `q_depth=0 q_block=0 q_retry=0`) but never emits a response, only `ping`. This is the same server-side VAD merge failure the pad length mitigates but can't eliminate (see the 27→43-frame history above). The only exit from `ORB_LOADING` is an incoming agent response, so without recovery the orb hangs indefinitely. **Diagnostic tell:** WS stays `up`, uptime keeps climbing (NOT a crash/disconnect), and no `msg: not valid JSON` lines (rules out a heap-starved dropped RX parse — the send path is PSRAM so low `heap_int` doesn't touch it).
+- The `heartbeat_task` stale-turn watchdog is now **two-stage**, both one-shot, both keyed off `s_ptt_close_us` (cleared by `process_message` on any non-ping/pong event, which cancels whichever stage hasn't fired):
+  - **Stage 1 — nudge (`PTT_STALE_TURN_WARN_MS` = 8000):** re-send the tail pad to re-trigger the server VAD. Harmless if the turn was merely slow (server already closed it; trailing silence is ignored). Cold-start responses can legitimately take ~10 s, so 8 s with zero non-ping traffic is a near-certain real miss.
+  - **Stage 2 — give up (`PTT_STALE_TURN_RECOVER_MS` = 16000):** revert UI to `ORB_MUTED` + clear the watchdog so the orb is usable again instead of frozen. 16 s is comfortably past the ~10 s cold-start max, so a slow-but-valid turn is never aborted. Safe if a late response arrives — its audio flips the UI to `ORB_AGENT`.
+- **The nudge is routed through `mic_task`, NOT sent from `heartbeat_task`.** Heartbeat only sets `s_pad_resend_request`; `mic_task` consumes it at the top of its loop and only when the mic is idle (`!open && !ptt`). This keeps every `send_silence_frames`/`s_mic_pcm` access on the buffers' owning task — sending the pad from `heartbeat_task` directly would race a live capture. Don't move the resend off `mic_task`.
+- All three flags (`s_stale_warned`, `s_stale_recovered`, `s_pad_resend_request`) reset at every `s_ptt_close_us` arming site: PTT real-turn close, NFC inject (`convai_send_user_message`), and real-response arrival. NFC injects get the same recovery for free.
+
 ## ElevenLabs WSS
 Full reference: [CONVAI.md](CONVAI.md). The short-form rules below are the
 load-bearing ones — anything more nuanced is in CONVAI.md.
@@ -30,8 +38,8 @@ load-bearing ones — anything more nuanced is in CONVAI.md.
   - **Periodic `user_activity` every 60 s** while WS is up and PTT is idle — proactive keepalive, matches `maintain_pong()` in the legacy Pi (`futuresGarden/main.py`). Without it, the server's ping cadence could drift past our `inactivity_timeout` and we die silently. Sent from `heartbeat_task`.
 - WSS task stack: **6144 bytes** (`task_stack=6144` in `convai_start`). Was 8192 originally, but by the time `convai_start` runs the internal heap is fragmented by WiFi/lwIP/mbedTLS and the largest contiguous block is ~7.5 KB; 8 KB stack fails to allocate. 6 KB fits and still leaves ~2 KB margin over the WS handler's observed worst case (cJSON parse + 768 B audio chunk + base64 decode). Do not raise without checking `start: heap_int=N largest_int=M` probe at boot.
 - Reassembly buffer: 2 MB PSRAM — agent audio events come in as single messages up to 250+ KB
-- PCM ring: 128 KB PSRAM, drained by playback task on core 1
-- Decode audio in 1 KB / 768 B base64 chunks with `portMAX_DELAY` backpressure — never accumulate a whole turn in RAM
+- PCM ring: **512 KB PSRAM** (was 128 KB), drained by playback task on core 1 — sized to hold ~a whole turn so the WS task doesn't block mid-turn and starve WiFi RX (see "Memory" section below)
+- Decode audio in 1 KB / 768 B base64 chunks with `portMAX_DELAY` backpressure — decode incrementally into the ring, never allocate a second whole-turn copy
 - Persistent WSS across many user turns. Only `convai_stop()` closes it; called from NFC re-scan path.
 
 ### App-level send queue (the fix for "conversation restarts mid-PTT")
@@ -42,15 +50,68 @@ load-bearing ones — anything more nuanced is in CONVAI.md.
   - `sender_task` (pinned core 0, prio 5) pops one item at a time, sends it, retries the same item on failure with **500 ms backoff**. Never drops a frame.
   - **Producer never drops either** — `xRingbufferSend(..., portMAX_DELAY)` on queue-full. `mic_task` will block on enqueue if the link is genuinely down; mic capture pauses, no audio is lost. Counted in `s_queue_block_count`.
   - Direct sends (kept bypassing the queue): pong, `user_activity`, `send_initiation`. They're rare or one-shot — too infrequent to drive fail-fast.
-- **Three convai task stacks live in PSRAM** via `xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM)`: `sender_task` (4 KB), `mic_task` (4 KB), `heartbeat_task` (3 KB). Only `playback_task` (4 KB) and the WS lib's own task (6 KB) remain in internal SRAM. By the time `convai_start` runs, internal heap is fragmented enough that 4 KB allocations may fit ONCE (playback) but the next one fails — silently, no panic. When `mic_task` failed to spawn, PTT did nothing (button events fired but no audio was sent) and the only signal was the `start: mic_task spawn FAILED` log line. Keep these three in PSRAM — a few µs context-switch overhead is irrelevant; the alternative is silent feature loss.
+- **All four convai task stacks live in PSRAM** via `xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM)`: `sender_task` (**8 KB**), `mic_task` (4 KB), `heartbeat_task` (**8 KB**), `playback_task` (4 KB). Only the WS lib's own task (6 KB) remains in internal SRAM.
+  - **Why `sender_task` and `heartbeat_task` are 8 KB, not 4/3 KB:** both call `esp_websocket_client_send_text` directly, which descends into **mbedTLS TLS-record encryption** — stack-hungry. `sender_task` at 4 KB ran with only ~52 bytes free on the clean send path and **overflowed** (confirmed by coredump: task `convai_send`, `4144/52`) the moment a send hit the contended / partial-write path (`transport_poll_write(0)` → deeper transport+mbedTLS frames). NFC custom-phrase injects made this reliable: they burst 43 silence frames with pong **not** skipped (`s_ptt_held==false`), so the sends contend with pong replies right after the greeting → deep path → overflow. PTT avoids it only because it *does* skip pong (§ pong gate). `heartbeat_task` (60 s `user_activity`) is the same defect on an even smaller stack. Since they're PSRAM stacks, the bump costs no internal SRAM. `mic_task`/`playback_task` stay 4 KB — they do **no** TLS writes (`mic_task` only base64-encodes + enqueues; `playback_task` drains the PCM ring to I2S). Don't shrink sender/heartbeat back below 8 KB. By the time `convai_start` runs, internal heap is fragmented enough that a 4 KB internal allocation may fit ONCE but the next one fails — silently, no panic. When `mic_task` failed to spawn, PTT did nothing (button events fired but no audio was sent), signalled only by `start: mic_task spawn FAILED`. `playback_task` was the last holdout in internal SRAM on the theory that "one 4 KB internal stack still fits" — it doesn't on release builds: the OTA GitHub handshake leaves `heap_int` ~7 KB lower than a dev build that skips OTA, so playback intermittently failed to spawn → **no agent audio + UI wedged on `ORB_LOADING`** (agent audio arrives but nothing drains the PCM ring or advances the state to `ORB_AGENT`). Now in PSRAM like the rest. Keep all four in PSRAM — a few µs context-switch overhead is irrelevant; the alternative is silent feature loss.
+  - **`playback_task` is load-bearing, so its spawn failure is now fatal to the start** (not just logged). If it can't spawn even from PSRAM, `convai_start` calls `convai_stop()` (full teardown) and returns `false`. Both callers — `post_connect_task` ([Wireless.c](main/Wireless/Wireless.c)) and NFC re-scan ([nfc.c](main/NFC/nfc.c)) — retry up to 3× (1 s apart) since a failed start fully tears down and a retry gets a freshly-settled heap; on final failure they drop to a non-`LOADING` state (`ORB_CONFIG` at boot, `ORB_MUTED` after NFC) so the orb never sits frozen and an NFC re-scan can retry. Don't revert `convai_start` to ignoring the playback spawn result.
 - **On `WEBSOCKET_EVENT_DISCONNECTED`** the queue is drained (frames are for a dead session; replaying them against the reconnected session's fresh greeting context would confuse the server). `s_q_bytes_in` / `s_q_bytes_out` are reset.
 - **Observability** (heartbeat verbose line):
   - `q_depth=NB` — current backlog. Healthy steady state is 0; non-zero during PTT only if sender is briefly behind.
   - `q_block=N` — cumulative times producer blocked because queue was full. Should stay 0 in normal operation.
   - `q_retry=N` — cumulative `send_text` failures. Stays 0 on a healthy link; rises during real congestion.
   - `sender: sent #N (item=NB, last_fail_streak=K)` every 33 successful sends. Confirms sender is alive and how often it had to retry.
-- **Heap probe at WS start** (`start: heap_int=N largest_int=M psram=K before client_start`) is intentional — keep it. Confirmed baseline after OTA changes: `heap_int≈22 KB, largest_int≈7.6 KB`. The WS task takes that largest block; everything after has to fit in the next-largest fragment. That's why three of the four convai tasks live in PSRAM (above). If `largest_int` ever drops below ~6500, the WS task itself is at risk — investigate before doing anything else.
+- **Heap probe at WS start** (`start: heap_int=N largest_int=M psram=K before client_start`) is intentional — keep it. Confirmed baseline after OTA changes: `heap_int≈22 KB, largest_int≈7.6 KB` — but release builds that run the OTA GitHub handshake have been observed as low as `heap_int≈15 KB` at this probe (a dev build skips OTA and sits higher). The WS task takes the largest block; everything after has to fit in the next-largest fragment. That's why **all four** convai tasks now live in PSRAM (above) — the WS lib task (6 KB, non-movable) is the only internal-SRAM stack left. If `largest_int` ever drops below ~6500, the WS task itself is at risk — investigate before doing anything else. If `heap_int` keeps trending down release-over-release, find where the OTA path isn't giving memory back before it squeezes the WS task.
 - **Don't reintroduce direct `send_text` calls in `mic_task`**. The whole fix is that the WS lib never sees a fail-fast pattern from us. A single direct send from the mic loop would re-introduce the bug.
+
+## Memory — internal SRAM is THE scarce resource (keep big/frequent allocs in PSRAM)
+
+This is the single most load-bearing constraint on the whole build, and it caused a long
+cascade of confusing failures. **Internal SRAM (DRAM) is nearly exhausted at runtime** — the
+LVGL RGB framebuffer + bounce buffers, the WSS task, mbedTLS, WiFi/lwIP, and audio leave only
+**~13 KB free at boot**, and a long ElevenLabs agent audio turn drives it toward **0 KB**.
+PSRAM, by contrast, has ~3 MB free. So the rule is: **anything big or frequently allocated must
+live in PSRAM, never internal SRAM.** Every one of these is deliberate — do not revert:
+
+- **convai task stacks → PSRAM** (`sender_task`/`heartbeat_task` 8 KB, `mic`/`playback` 4 KB) —
+  see the WSS section. `sender_task` at 4 KB internal-adjacent stack **overflowed** inside the
+  mbedTLS TLS-write path and hard-reset the device (confirmed by coredump). 8 KB PSRAM fixed it.
+- **WiFi/lwIP buffers → PSRAM** (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`, `sdkconfig.defaults`).
+  With them internal, a long audio turn starved the TCP send path → `transport_poll_write(0)` →
+  **WS disconnect + re-greet**, and starved the WiFi driver → `wifi:m f null` frame drops. Also
+  `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64` (was 32) to absorb agent-audio bursts.
+- **mbedTLS buffers → PSRAM** (`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` + dynamic buffers, and
+  `CONFIG_MBEDTLS_HARDWARE_AES=n` because HW-AES needs DMA-capable internal SRAM per TLS record).
+  Pre-existing; same theme.
+- **cJSON → PSRAM** (`cJSON_InitHooks` at the top of `main.c::app_main`). cJSON parses every
+  inbound Convai message (audio events + the flurry of `agent_chat_response_part` deltas); its
+  small nodes were landing in internal SRAM (allocs `< CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16 KB`
+  go internal) and craters internal heap to 0 during turns. Now all in PSRAM.
+- **PCM ring 512 KB PSRAM** (`convai.c PCM_RING_BYTES`, was 128 KB). The WS task chunk-decodes
+  base64 and pushes to this ring with `portMAX_DELAY` backpressure; too small → the WS task
+  BLOCKS mid-turn, stops draining the socket, and WiFi RX backs up → `wifi:m f null`. 512 KB ≈
+  16 s holds a whole turn so the WS task never blocks. (Residual `m f null` on *very* long turns
+  is the base64 decode itself being CPU-bound on the WS task — the real cure is the deferred
+  "decode-decouple" refactor in [CONVAI.md](CONVAI.md); not needed to ship.)
+- **Reassembly buffer 2 MB PSRAM**, **send queue 1 MB PSRAM** — pre-existing; same theme.
+
+**The `wifi:m f null` warning** = WiFi driver malloc for an RX frame returned NULL under internal
+SRAM pressure; it drops the frame (TCP retransmits). Non-fatal, but it's the canary for internal
+heap running low. If it reappears, check `heap_int` in the heartbeat — something moved a hot
+allocation back into internal SRAM.
+
+**Reading a crash dump (bench):** core-dump-to-flash is enabled bench-only (local `sdkconfig` +
+`partitions.coredump.csv`, a 64 KB `coredump` partition appended after `ota_1` — nothing
+committed). Panics can't print (audio killed the UART; UDP dies with the crash), so read the dump
+post-reboot over the ROM loader. The VSCode ESP terminal's IDF env is broken; call the project's
+env directly and **don't `fullclean`** (it rebuilds and breaks `.elf` symbolication):
+```
+export IDF_PATH=/Users/lynch/.espressif/v5.5/esp-idf
+export ESP_ROM_ELF_DIR=/Users/lynch/.espressif/tools/esp-rom-elfs/20241011/
+export PATH="/Users/lynch/.espressif/tools/xtensa-esp-elf-gdb/16.3_20250913/xtensa-esp-elf-gdb/bin:$PATH"
+PY=/Users/lynch/.espressif/python_env/idf5.5_py3.14_env/bin
+"$PY/esp-coredump" --chip esp32s3 --port <PORT> info_corefile build/ESP32-S3-Touch-LCD-2.8C-Test.elf
+```
+Close any serial monitor first (port-busy); device in download mode. Erase between tests:
+`"$PY/esptool.py" -p <PORT> erase_region 0x820000 0x10000`.
 
 ## OTA — boot-time GitHub release pull
 Release runbook: [`DEPLOYMENT.md`](DEPLOYMENT.md). Implementation: [`main/OTA/ota.c`](main/OTA/ota.c).

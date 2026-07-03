@@ -7,7 +7,7 @@
 #include "nfc.h"
 
 #define ORB_CIRCLE_DIAM     200
-#define ORB_NAME_Y          90        // (legacy — name now lives inside the circle)
+#define ORB_NAME_Y          60        // top-mid, above the central circle
 #define ORB_BATTERY_Y       420       // UI_SPEC.md §0: bot-mid, y = 420
 #define ORB_TICK_MS         50
 #define ORB_NAME_MAX        32
@@ -112,6 +112,14 @@ static _Atomic bool s_name_dirty = ATOMIC_VAR_INIT(false);
 
 static _Atomic int s_pending_battery_mv = ATOMIC_VAR_INIT(-1);  // millivolts, -1 = unset
 static int s_applied_battery_mv = -2;
+// Displayed battery percent, snapped to 5% steps with hysteresis. The 10 s
+// voltage average (BAT_Driver.c) can't cancel the sustained ~190 mV load-IR
+// drop when audio/PTT is active — that's a real voltage shift, and with only
+// 3.8 mV per 1% the raw percent visibly sags a few points under load. Snapping
+// to 5% and requiring the raw value to move a full half-step past the boundary
+// (>=5% from the shown step) before re-snapping keeps the label stationary.
+#define BATTERY_PCT_STEP 5
+static int s_battery_step = -1;  // currently displayed percent step, -1 = unset
 
 // LVGL animation callback — updates the arc's rotation each frame.
 static void sweep_arc_rotate_cb(void *var, int32_t val)
@@ -188,7 +196,8 @@ static void fade_opa_apply(lv_opa_t opa)
 {
     lv_obj_set_style_opa(s_circle,        opa, LV_PART_MAIN);
     lv_obj_set_style_opa(s_circle_label,  opa, LV_PART_MAIN);
-    lv_obj_set_style_opa(s_name_label,    opa, LV_PART_MAIN);
+    // s_name_label intentionally excluded — like the battery label, the agent
+    // name lives outside the central circle and stays visible across transitions.
     if (s_sweep_arc) {
         lv_obj_set_style_arc_opa(s_sweep_arc, opa, LV_PART_INDICATOR);
     }
@@ -280,22 +289,29 @@ static void orb_tick_cb(lv_timer_t *t)
             // BATTERY_MV_FULL (3.93 V → 100 %), clamped. Anchors are
             // board-after-harness-drop readings, not cell voltage — see BATTERY.md.
             int span = BATTERY_MV_FULL - BATTERY_MV_EMPTY;
-            int pct  = ((mv - BATTERY_MV_EMPTY) * 100) / span;
-            if (pct < 0)   pct = 0;
-            if (pct > 100) pct = 100;
+            int raw  = ((mv - BATTERY_MV_EMPTY) * 100) / span;
+            if (raw < 0)   raw = 0;
+            if (raw > 100) raw = 100;
+
+            // Snap to 5% steps with hysteresis: only re-snap once the raw
+            // percent has moved a full step (>=5%) away from the shown value,
+            // so it can't oscillate on a bucket boundary under load wobble.
+            if (s_battery_step < 0 ||
+                (raw - s_battery_step >= BATTERY_PCT_STEP) ||
+                (s_battery_step - raw >= BATTERY_PCT_STEP)) {
+                s_battery_step = ((raw + BATTERY_PCT_STEP / 2) / BATTERY_PCT_STEP)
+                                 * BATTERY_PCT_STEP;
+                if (s_battery_step > 100) s_battery_step = 100;
+            }
+            int pct = s_battery_step;
 
             uint32_t colour;
             if      (pct > 65) colour = BATTERY_COLOR_OK;
             else if (pct >= 30) colour = BATTERY_COLOR_MID;
             else               colour = BATTERY_COLOR_LOW;
 
-            // LVGL's lv_label_set_text_fmt has float (%f) support disabled in
-            // the locked LV config, so format the voltage from integer mv:
-            // 3940 mv -> "3.94V".
-            int v_whole = mv / 1000;
-            int v_frac  = (mv % 1000) / 10;   // hundredths of a volt
             lv_obj_set_style_text_color(s_battery_label, lv_color_hex(colour), 0);
-            lv_label_set_text_fmt(s_battery_label, "%d%% - %d.%02dV", pct, v_whole, v_frac);
+            lv_label_set_text_fmt(s_battery_label, "Battery: %d%%", pct);
         }
     }
 }
@@ -350,17 +366,19 @@ void orb_ui_init(void)
     lv_anim_set_exec_cb(&s_sweep_anim, sweep_arc_rotate_cb);
     lv_anim_set_path_cb(&s_sweep_anim, lv_anim_path_linear);
 
-    // Agent name label — inside the circle, above the state label.
-    // Typography per UI_SPEC.md §0: Montserrat 24, ink.muted (#888888).
-    s_name_label = lv_label_create(s_circle);
+    // Agent name label — top-mid, ABOVE the central circle. Parented to the
+    // screen (not s_circle) so it sits on the constant dark background and
+    // stays legible regardless of the circle's per-state colour. Montserrat 24,
+    // light ink for contrast against the loading / agent-speaking screens.
+    s_name_label = lv_label_create(scr);
     lv_label_set_text(s_name_label, "----");
-    lv_obj_set_style_text_color(s_name_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(s_name_label, lv_color_hex(0xCCCCCC), 0);
 #if LV_FONT_MONTSERRAT_24
     lv_obj_set_style_text_font(s_name_label, &lv_font_montserrat_24, 0);
 #elif LV_FONT_MONTSERRAT_20
     lv_obj_set_style_text_font(s_name_label, &lv_font_montserrat_20, 0);
 #endif
-    lv_obj_align(s_name_label, LV_ALIGN_CENTER, 0, -22);
+    lv_obj_align(s_name_label, LV_ALIGN_TOP_MID, 0, ORB_NAME_Y);
 
     // State label — Montserrat 26 / white, centred below the agent name.
     // Some states use multi-line text (e.g. "Connecting\nWiFi"); centre-

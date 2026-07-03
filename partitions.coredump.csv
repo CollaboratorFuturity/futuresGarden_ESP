@@ -1,0 +1,17 @@
+# BENCH-ONLY partition table — identical to partitions.csv plus a coredump
+# region appended at the end for crash diagnosis. Selected via the gitignored
+# local sdkconfig (CONFIG_PARTITION_TABLE_CUSTOM_FILENAME); the committed
+# partitions.csv is unchanged so releases keep today's exact layout.
+#
+# coredump is APPENDED after ota_1, so nvs/otadata/ota_0/ota_1 offsets are
+# identical to partitions.csv → NVS (device_id) is preserved across this flash.
+#
+# Name,     Type, SubType, Offset,   Size, Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      ,         0x2000,
+ota_0,      app,  ota_0,    0x20000,  0x400000,
+ota_1,      app,  ota_1,    ,         0x400000,
+# Panic backtraces land here (ESP_COREDUMP_ENABLE_TO_FLASH). Crashes happen
+# after i2s_audio_init kills the UART, so read it post-crash via
+# `idf.py coredump-info` with the device in download mode. 64 KB is ample.
+coredump,   data, coredump, ,        0x10000,

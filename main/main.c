@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include "sdkconfig.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -17,6 +19,18 @@
 #include "convai.h"
 
 static const char *MAIN_TAG = "main";
+
+// ─── Route cJSON allocations to PSRAM ────────────────────────────────────
+// cJSON parses every inbound Convai message (audio events, the flurry of
+// agent_chat_response_part deltas, etc.). By default it uses the standard
+// allocator, which for <16 KB allocations (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL)
+// means INTERNAL SRAM — and internal SRAM is the scarce resource here. During a
+// long agent turn that dragged internal heap down to ~0 KB, which starved the
+// WiFi driver's buffers (`wifi:m f null` frame drops) and left no room to
+// rebuild a TLS session on a reconnect. Pointing cJSON's malloc at PSRAM (3 MB
+// free) moves all of that off internal SRAM. Set once, before any parse.
+static void *cjson_psram_malloc(size_t sz) { return heap_caps_malloc(sz, MALLOC_CAP_SPIRAM); }
+static void  cjson_psram_free(void *p)      { heap_caps_free(p); }
 
 // ─── Diagnostic log verbosity ────────────────────────────────────────────
 // 1 = show the per-2s convai heartbeat ("hb: ws=up …") and the per-ping
@@ -66,6 +80,11 @@ void Driver_Init(void)
 }
 void app_main(void)
 {
+    // Route ALL cJSON allocations to PSRAM before anything parses JSON — keeps
+    // the scarce internal SRAM free for WiFi/lwIP/mbedTLS (see note above).
+    cJSON_InitHooks(&(cJSON_Hooks){ .malloc_fn = cjson_psram_malloc,
+                                    .free_fn   = cjson_psram_free });
+
     // PN532 nacks every "no tag present" status poll; the IDF 5.5
     // i2c.master driver logs each one at ERROR. Tag reads still work —
     // mute the noise so the UDP log isn't drowned.

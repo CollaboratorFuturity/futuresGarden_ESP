@@ -91,7 +91,22 @@ static void post_connect_task(void *arg)
         // the device goes straight from CONFIG to LOADING → agent greeting.
         // NFC scans still restart the session (see nfc.c::handle_uid).
         orb_ui_set_state(ORB_LOADING);
-        convai_start(s_agent_id);
+        // convai_start returns false if a required task (e.g. playback) can't
+        // spawn — it fully tears itself down in that case, so a retry gets a
+        // fresh attempt against a heap that may have settled differently.
+        // Bounded so a genuinely unrecoverable condition can't spin forever.
+        bool started = false;
+        for (int attempt = 1; attempt <= 3 && !started; attempt++) {
+            started = convai_start(s_agent_id);
+            if (!started) {
+                ESP_LOGE(WIFI_TAG, "convai_start attempt %d/3 failed; retrying", attempt);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+        if (!started) {
+            ESP_LOGE(WIFI_TAG, "convai_start failed after 3 attempts — no session");
+            orb_ui_set_state(ORB_CONFIG);  // leave a non-LOADING state; NFC re-scan retries
+        }
     } else {
         ESP_LOGE(WIFI_TAG, "config fetch failed");
         // Stay in ORB_CONFIG so the screen reflects that we got the network
@@ -267,6 +282,19 @@ void WIFI_Init(void *arg)
     xTaskCreatePinnedToCore(wifi_manager_task, "wifi_mgr", 4096, NULL, 3, &s_wifi_mgr, 0);
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Disable WiFi modem-sleep. Default is WIFI_PS_MIN_MODEM (radio naps between
+    // DTIM beacons when traffic is light). The orb holds a persistent WSS open
+    // across idle stretches, and while conversation-idle the traffic is just the
+    // ~2 s ping/pong — light enough that the radio sleeps most of the time. Some
+    // APs then treat the napping-but-still-associated STA as gone and deauth it,
+    // forcing a full re-associate + new DHCP lease + WSS reconnect, which makes
+    // the agent re-greet from scratch (looked like a "random restart" — device
+    // uptime never reset). WIFI_PS_NONE keeps the radio fully awake so the AP
+    // never has a napping client to misjudge. Costs ~20-40 mA extra idle draw;
+    // acceptable since the orb is usually USB-powered and link stability wins.
+    // Must be called after esp_wifi_start().
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     vTaskDelete(NULL);
 }

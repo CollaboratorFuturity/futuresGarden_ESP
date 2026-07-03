@@ -39,7 +39,7 @@ extern const char gts_root_r1_pem_end[]   asm("_binary_gts_root_r1_pem_end");
 // for app-triggered "user is interacting" hints, not a timer.
 #define WS_URI_FMT             "wss://api.elevenlabs.io/v1/convai/conversation?agent_id=%s&inactivity_timeout=120"
 #define WS_NETWORK_TIMEOUT_MS  10000
-#define WS_RECONNECT_DELAY_MS  5000
+#define WS_RECONNECT_DELAY_MS  1500   // was 5000; shorter so any disconnect (genuine WiFi/ECONNRESET) recovers in ~2 s, not ~8 s
 #define WS_BUFFER_SIZE         8192
 
 // Reassembly buffer for fragmented WS messages. The pre-generated greeting
@@ -50,12 +50,18 @@ extern const char gts_root_r1_pem_end[]   asm("_binary_gts_root_r1_pem_end");
 // happen in practice we'll see overflow warnings and bump this.
 #define REASM_SIZE             (2 * 1024 * 1024)
 
-// PCM ring between WS receive and the speaker. Modest, because the WS task
-// chunk-decodes the base64 and pushes to the ring with backpressure
-// (portMAX_DELAY) — the ring acts as a small smoothing buffer, not as
-// "fit a whole turn." 128 KB = 4 s, plenty to absorb network jitter while
-// the speaker drains at 32 KB/s.
-#define PCM_RING_BYTES         (128 * 1024)
+// PCM ring between WS receive and the speaker. Sized to hold ~a whole turn
+// (512 KB ≈ 16 s at the 32 KB/s speaker rate), deliberately: the WS task
+// chunk-decodes base64 and pushes here with portMAX_DELAY backpressure, so if
+// the ring is too small the WS task BLOCKS mid-turn, stops draining the socket,
+// and the WiFi RX pool exhausts → `wifi:m f null` frame drops + retransmit lag.
+// A big PSRAM ring lets the WS task dump the turn and get straight back to
+// reading. No latency cost (playback starts on the first byte) and no extra
+// screen bandwidth (drains at a fixed 32 KB/s regardless of size). If very long
+// monologues still log `m f null`, bump to 1 MB — or do the decode-decouple
+// refactor (WS task hands raw audio to a decode task; see CONVAI.md / plan).
+// Was 128 KB (4 s), which back-pressured on any turn longer than that.
+#define PCM_RING_BYTES         (512 * 1024)
 
 // Decoded-audio chunk written to the speaker per i2s_channel_write. Bigger
 // = less overhead; smaller = lower latency / better responsiveness when we
@@ -132,6 +138,15 @@ static volatile int64_t s_last_audio_rx_us   = 0;
 // interrupting agent replies.
 static volatile bool    s_agent_speaking     = false;
 
+// Set the moment the agent's *audio* response starts arriving (in
+// handle_audio_event). Used only to abort the NFC-inject turn-end pad early:
+// once the agent is responding, the server has already closed the turn, so the
+// remaining silence frames are pointless AND harmful — they'd fight the WS-lib
+// recursive lock that handle_audio_event holds while draining audio, which is
+// what caused the post-inject WS disconnect. Cleared by convai_send_user_message
+// right before it sends the (abortable) pad. Not consulted by the PTT tail.
+static volatile bool    s_turn_response_started = false;
+
 // Observability — used by ws_event_handler error path + heartbeat_task.
 // All updates are write-once-from-single-task so plain assignment is fine.
 static volatile int64_t  s_last_rx_us      = 0;   // last byte received from WS
@@ -162,10 +177,19 @@ static volatile uint32_t s_pongs_skipped_ptt = 0;
 
 // PTT-close timestamp for the "stale turn" watchdog. Set by mic_task at the
 // PTT-release edge (real-turn branch), cleared by process_message when any
-// non-ping/pong server event arrives. Heartbeat raises a one-shot warning
-// if it stays set past PTT_STALE_TURN_WARN_MS.
-static volatile int64_t  s_ptt_close_us   = 0;
-static volatile bool     s_stale_warned   = false;
+// non-ping/pong server event arrives. Heartbeat drives a two-stage recovery
+// off this timestamp: WARN+nudge at PTT_STALE_TURN_WARN_MS, then give-up at
+// PTT_STALE_TURN_RECOVER_MS. All three are reset together (PTT-close edge and
+// on any real server event) so each turn starts clean.
+static volatile int64_t  s_ptt_close_us     = 0;
+static volatile bool     s_stale_warned     = false;   // stage-1 one-shot
+static volatile bool     s_stale_recovered  = false;   // stage-2 one-shot
+// Set by heartbeat_task's stale watchdog, consumed by mic_task (the owner of
+// the s_mic_* buffers) when the mic is idle — re-sends the tail silence pad to
+// nudge the server's turn-detection VAD. Routed through mic_task, NOT sent from
+// heartbeat_task directly, so send_silence_frames never races a live capture on
+// s_mic_pcm.
+static volatile bool     s_pad_resend_request = false;
 
 // ─── Mic streaming task (PTT) ───────────────────────────────────────────
 // Implements PTT per BEHAVIOR.md §3. Frame cadence is 30 ms (480 samples
@@ -189,10 +213,19 @@ static volatile bool     s_stale_warned   = false;
 #define PTT_SHORT_TURN_MIN_MS    800         // §2.4 short-turn skip threshold
 
 // If the server doesn't send any non-ping message within this window after
-// PTT close (real-audio branch only), heartbeat logs a "turn stale" warning.
-// First-turn LLM cold start can legitimately take ~10s; raised from 5000
-// after we saw false alarms on slow but valid first responses.
+// PTT close (real-audio branch only), heartbeat WARNs and asks mic_task to
+// re-send the tail pad (stage 1 — nudge the server VAD). First-turn LLM cold
+// start can legitimately take ~10s; raised from 5000 after we saw false alarms
+// on slow but valid first responses. The nudge is harmless if the turn is
+// merely slow (the server has already closed the user turn; extra trailing
+// silence is ignored).
 #define PTT_STALE_TURN_WARN_MS   8000
+// If STILL nothing this long after PTT close, give up on the turn (stage 2):
+// revert the UI to ORB_MUTED and clear the watchdog so the user gets a
+// responsive orb back instead of a permanently-stuck ORB_LOADING. Comfortably
+// past the ~10s legitimate cold-start max so a slow-but-valid turn is never
+// aborted (a real response clears s_ptt_close_us long before this fires).
+#define PTT_STALE_TURN_RECOVER_MS  16000
 
 static int16_t *s_mic_pcm  = NULL;
 static char    *s_mic_b64  = NULL;
@@ -311,10 +344,18 @@ static int mic_send_chunk_with_status(size_t samples)
 // Send N silence frames (each 30 ms) back-to-back, paced at one frame per
 // 30 ms so the server sees real-time cadence. Used as the post-PTT tail
 // pad (BEHAVIOR.md §3.4). Buffer is assumed pre-zeroed.
-static void send_silence_frames(int n)
+//
+// abortable: if true, stop early the moment the agent starts responding
+// (s_turn_response_started). Only the NFC-inject pad sets this — once the agent
+// replies, the server has already closed the turn, so the rest of the pad is
+// wasted and would contend with the WS-lib lock held by handle_audio_event.
+// The PTT tail passes false: it must always fully send (and the flag is
+// stale-true from the previous turn).
+static void send_silence_frames(int n, bool abortable)
 {
     memset(s_mic_pcm, 0, MIC_CHUNK_BYTES);
     for (int i = 0; i < n && s_running; i++) {
+        if (abortable && s_turn_response_started) break;
         mic_send_chunk_with_status(MIC_CHUNK_SAMPLES);
         vTaskDelay(pdMS_TO_TICKS(30));
     }
@@ -328,6 +369,17 @@ static void mic_task(void *arg)
 
     while (s_running) {
         bool ptt = s_ptt_held;
+
+        // ── Stale-turn nudge (stage 1): heartbeat_task asks us to re-send the
+        // tail pad when the server missed the end-of-turn. Done here, on the
+        // mic buffers' owning task and only while the mic is idle, so
+        // send_silence_frames never races a live capture on s_mic_pcm. ───────
+        if (s_pad_resend_request && !open && !ptt) {
+            s_pad_resend_request = false;
+            ESP_LOGW(TAG, "stale-turn nudge: re-sending %d-frame tail pad",
+                     PTT_TAIL_SILENCE_FRAMES);
+            send_silence_frames(PTT_TAIL_SILENCE_FRAMES, false);
+        }
 
         // ── Rising edge: ptt=true while mic closed ─────────────────────
         if (ptt && !open) {
@@ -385,7 +437,7 @@ static void mic_task(void *arg)
                               "padding to close turn, not waiting for response",
                          real_audio_ms, PTT_SHORT_TURN_MIN_MS, duration_ms);
                 orb_ui_set_state(ORB_MUTED);
-                send_silence_frames(PTT_TAIL_SILENCE_FRAMES);
+                send_silence_frames(PTT_TAIL_SILENCE_FRAMES, false);
             } else {
                 ESP_LOGI(TAG, "PTT: closed (%d ms held, real %d ms in %d frames) — pad %d ms",
                          duration_ms, real_audio_ms, chunks_this_press,
@@ -393,7 +445,9 @@ static void mic_task(void *arg)
                 orb_ui_set_state(ORB_LOADING);   // yellow: waiting for agent
                 s_ptt_close_us = esp_timer_get_time();
                 s_stale_warned = false;
-                send_silence_frames(PTT_TAIL_SILENCE_FRAMES);
+                s_stale_recovered = false;
+                s_pad_resend_request = false;
+                send_silence_frames(PTT_TAIL_SILENCE_FRAMES, false);
             }
             continue;
         }
@@ -510,6 +564,12 @@ static void handle_audio_event(const cJSON *audio_evt)
     // keep flowing on the wire.
     s_last_audio_rx_us = esp_timer_get_time();
 
+    // The agent is now responding — signal the inject pad to stop (see
+    // s_turn_response_started). This is also the exact point the WS task begins
+    // holding client->lock in the blocking xStreamBufferSend below, which is
+    // what a still-running pad would contend with.
+    s_turn_response_started = true;
+
     const char *b64_str = b64->valuestring;
     size_t b64_total = strlen(b64_str);
 
@@ -517,9 +577,11 @@ static void handle_audio_event(const cJSON *audio_evt)
     // so we don't split a base64 quad) → 768 bytes of PCM per chunk. Small
     // on purpose: this runs on the websocket_client task whose stack is
     // ~4 KB and is already shared with cJSON + mbedTLS. Push each chunk to
-    // the ring with portMAX_DELAY backpressure — the WS task naturally
-    // paces itself to the speaker's drain rate, so we can handle arbitrarily
-    // large audio events (10s, 30s, longer) with the small 128 KB ring.
+    // the ring with portMAX_DELAY backpressure. The 512 KB ring holds ~a whole
+    // turn so this normally does NOT block; if a turn exceeds it, backpressure
+    // paces the WS task to the speaker rate (correct, but that blocking is what
+    // starves WiFi RX → `wifi:m f null`, which is why the ring is big — see
+    // CLAUDE.md "Memory" and the deferred decode-decouple refactor in CONVAI.md).
     enum { B64_CHUNK = 1024, PCM_CHUNK = (B64_CHUNK / 4) * 3 };
     uint8_t pcm[PCM_CHUNK];
     size_t consumed = 0;
@@ -537,9 +599,9 @@ static void handle_audio_event(const cJSON *audio_evt)
                      rc, (unsigned)consumed, (unsigned)take);
             return;
         }
-        // Blocking push — ring will fill and then we wait for the speaker
-        // to drain. This is the entire mechanism that lets us survive
-        // arbitrarily long agent turns with a 128 KB ring.
+        // Blocking push — only blocks if the 512 KB ring fills (a turn longer
+        // than ~16 s); then we wait for the speaker to drain. Survives
+        // arbitrarily long turns; the size keeps it from blocking on normal ones.
         xStreamBufferSend(s_pcm, pcm, pcm_len, portMAX_DELAY);
 
         consumed += take;
@@ -581,6 +643,8 @@ static void process_message(const char *data, int len)
     if (strcmp(type_str, "ping") != 0 && strcmp(type_str, "pong") != 0) {
         s_ptt_close_us = 0;
         s_stale_warned = false;
+        s_stale_recovered = false;
+        s_pad_resend_request = false;
     }
 
     if (strcmp(type_str, "audio") == 0) {
@@ -925,19 +989,38 @@ static void heartbeat_task(void *arg)
             }
         }
 
-        // Stale-turn watchdog: one-shot WARN if PTT closed > 5 s ago and
-        // the server hasn't sent us anything but pings since.
+        // Stale-turn watchdog: the server received our turn but sent nothing
+        // but pings back — it missed the end-of-turn. Two-stage recovery,
+        // both one-shot, both keyed off the PTT-close timestamp (cleared by
+        // process_message the instant any real server event arrives, which
+        // cancels whichever stage hasn't fired yet).
         int64_t pclose = s_ptt_close_us;
-        if (pclose > 0 && !s_stale_warned) {
+        if (pclose > 0) {
             int64_t age_ms = (esp_timer_get_time() - pclose) / 1000;
-            if (age_ms > PTT_STALE_TURN_WARN_MS) {
+            // Stage 1 — WARN + nudge: ask mic_task to re-send the tail pad to
+            // re-trigger the server VAD. Cheap and safe; often unsticks it.
+            if (age_ms > PTT_STALE_TURN_WARN_MS && !s_stale_warned) {
                 ESP_LOGW(TAG, "TURN STALE: %lldms since PTT close, no server "
                               "response (last=%s, ws=%s). Server likely missed "
-                              "end-of-turn — next PTT will merge.",
+                              "end-of-turn — re-sending tail pad to nudge VAD.",
                          (long long)age_ms,
                          s_last_msg_type[0] ? s_last_msg_type : "-",
                          ws_conn ? "up" : "DOWN");
+                s_pad_resend_request = true;
                 s_stale_warned = true;
+            }
+            // Stage 2 — give up: nudge didn't land. Don't leave the user
+            // staring at a frozen ORB_LOADING; revert to ORB_MUTED and clear
+            // the watchdog so the next press is a clean turn. Safe even if a
+            // late response arrives — its audio will flip the UI to ORB_AGENT.
+            if (age_ms > PTT_STALE_TURN_RECOVER_MS && !s_stale_recovered) {
+                ESP_LOGW(TAG, "TURN STALE: %lldms, no response after nudge — "
+                              "giving up, reverting to idle so the orb is usable.",
+                         (long long)age_ms);
+                s_stale_recovered = true;
+                s_pad_resend_request = false;
+                s_ptt_close_us = 0;
+                orb_ui_set_state(ORB_MUTED);
             }
         }
     }
@@ -1046,6 +1129,7 @@ bool convai_start(const char *agent_id)
     s_agent_done_signal = false;
     s_last_audio_rx_us  = 0;
     s_agent_speaking    = false;
+    s_turn_response_started = false;
     s_queue_block_count = 0;
     s_send_retries      = 0;
     s_q_bytes_in        = 0;
@@ -1087,8 +1171,17 @@ bool convai_start(const char *agent_id)
     // RAM fragmentation. The other three tasks stay in internal RAM
     // because they're already known to work.
     if (s_queue) {
+        // 8 KB (not 4 KB): sender_task calls esp_websocket_client_send_text →
+        // mbedTLS TLS-record encryption, which is stack-hungry. At 4 KB it ran
+        // with ~52 bytes free on the clean send path and OVERFLOWED the moment a
+        // send hit the contended/partial-write path (transport_poll_write(0)) —
+        // confirmed by coredump (task "convai_send", 4144/52). Deeper send paths
+        // are reachable any time the WS transport is congested; NFC custom-phrase
+        // injects made it reliable because they burst frames with pong NOT
+        // skipped (s_ptt_held==false). The WS lib's own task runs this same path
+        // at 6 KB; 8 KB gives comfortable margin. PSRAM stack, so no SRAM cost.
         BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(
-            sender_task, "convai_send", 4096, NULL, 5,
+            sender_task, "convai_send", 8192, NULL, 5,
             &s_sender_task, 0, MALLOC_CAP_SPIRAM);
         if (rc != pdPASS) {
             ESP_LOGE(TAG, "start: sender_task spawn FAILED (rc=%d, "
@@ -1104,10 +1197,38 @@ bool convai_start(const char *agent_id)
         ESP_LOGE(TAG, "start: send queue is NULL — sender_task NOT spawned, "
                       "mic frames will be dropped");
     }
-    // Playback task pulls from the PCM ring and drives the speaker.
-    if (xTaskCreatePinnedToCore(playback_task, "convai_play", 4096, NULL, 5,
-                                 &s_playback_task, 1) != pdPASS) {
-        ESP_LOGE(TAG, "start: playback_task spawn FAILED");
+    // Playback task pulls from the PCM ring and drives the speaker. Its stack
+    // lives in PSRAM for the SAME reason as sender/mic/heartbeat below — by the
+    // time we get here internal SRAM is too fragmented to reliably fit a 4 KB
+    // stack, and the WS lib task just claimed the largest internal block. It
+    // used to spawn in internal RAM on the assumption that "one 4 KB internal
+    // stack still fits"; that assumption is false on release builds (the OTA
+    // GitHub handshake lowers heap_int ~7 KB vs a dev build that skips OTA), so
+    // it intermittently failed to spawn → no audio + UI wedged on ORB_LOADING.
+    // The PCM ring and I2S DMA buffers are already PSRAM; the stack only holds
+    // locals, so PSRAM is safe (the task simply isn't scheduled during the rare
+    // cache-disabled windows, same as the other three).
+    //
+    // This is the one task the session cannot function without, so if it STILL
+    // can't spawn we fail the whole start: tear everything down and return false
+    // so the caller retries instead of leaving a half-dead, audio-less session
+    // up (WS connected, greeting received, nothing to play it, UI stuck).
+    {
+        BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(
+            playback_task, "convai_play", 4096, NULL, 5,
+            &s_playback_task, 1, MALLOC_CAP_SPIRAM);
+        if (rc != pdPASS) {
+            ESP_LOGE(TAG, "start: playback_task spawn FAILED (rc=%d, "
+                          "heap_int=%u largest=%u psram=%u) — aborting session",
+                     (int)rc,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+            s_playback_task = NULL;
+            convai_stop();   // full teardown: s_running=false, WS close/destroy,
+                             // free PSRAM buffers, self-exit sender_task
+            return false;
+        }
     }
     // Mic and heartbeat task stacks live in PSRAM (same pattern as
     // sender_task above) — by the time convai_start runs, the OTA path has
@@ -1134,8 +1255,13 @@ bool convai_start(const char *agent_id)
     // every 2s for the lifetime of the conversation. Stack is small —
     // it only calls esp_log + heap_caps + atomic reads.
     {
+        // 8 KB (not 3 KB): heartbeat_task sends the 60 s user_activity keepalive
+        // via the same esp_websocket_client_send_text → mbedTLS write path that
+        // overflowed sender_task's 4 KB stack. Same latent defect on an even
+        // smaller stack; bump it too rather than wait for the next coredump.
+        // PSRAM stack, so no internal-SRAM cost.
         BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(
-            heartbeat_task, "convai_hb", 3072, NULL, 1,
+            heartbeat_task, "convai_hb", 8192, NULL, 1,
             &s_heartbeat_task, 0, MALLOC_CAP_SPIRAM);
         if (rc != pdPASS) {
             ESP_LOGE(TAG, "start: heartbeat_task spawn FAILED (rc=%d)", (int)rc);
@@ -1216,9 +1342,19 @@ bool convai_send_user_message(const char *text)
     // (symptom: stuck on ORB_LOADING). Append the same tail-silence pad a PTT
     // release sends — BEHAVIOR.md §6.2 / §3.5 "force_turn_end" — so the VAD
     // closes the turn. Also arm the stale-turn watchdog like the PTT path does.
+    //
+    // The pad is ABORTABLE: it stops the instant the agent's audio starts
+    // arriving (s_turn_response_started). By then the server has already closed
+    // the turn, so the remaining frames are wasted — and worse, they'd fight
+    // the WS-lib recursive lock that handle_audio_event holds while draining
+    // that audio, which is what caused the post-inject WS disconnect. Clear the
+    // flag first so a fresh arrival (not a stale one) is what trips the abort.
     s_ptt_close_us = esp_timer_get_time();
     s_stale_warned = false;
-    send_silence_frames(PTT_TAIL_SILENCE_FRAMES);
+    s_stale_recovered = false;
+    s_pad_resend_request = false;
+    s_turn_response_started = false;
+    send_silence_frames(PTT_TAIL_SILENCE_FRAMES, true);
     return true;
 }
 

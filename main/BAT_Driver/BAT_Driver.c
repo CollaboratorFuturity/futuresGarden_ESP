@@ -78,8 +78,9 @@ int voltage[2][10];
 // Sliding-window moving average of the calibrated battery voltage. Driver_Loop
 // calls BAT_Get_Volts() every 100 ms, so a window of N spans ~N*100 ms. This
 // smooths out the load-dependent IR drop (WiFi/audio bursts) that otherwise
-// makes the displayed % jitter several points.
-#define BAT_AVG_WINDOW 20
+// makes the displayed % jitter several points. 100 samples ≈ 10 s window —
+// the gauge barely moves, which is what we want for a slow battery reading.
+#define BAT_AVG_WINDOW 100
 static float bat_window[BAT_AVG_WINDOW];
 static int   bat_window_idx = 0;
 static int   bat_window_count = 0;

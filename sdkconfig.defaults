@@ -41,6 +41,20 @@ CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 # no DMA requirement — small TLS throughput hit, no alloc failures.
 CONFIG_MBEDTLS_HARDWARE_AES=n
 
+# WiFi/lwIP buffers → PSRAM. Internal SRAM is THE scarce resource on this build
+# (LVGL framebuffers + WSS task + mbedTLS + audio leave only ~13 KB internal
+# free, and a long agent audio turn drives it toward 0). With WiFi/lwIP buffers
+# in internal SRAM, that starvation caused: TCP send pbuf alloc to fail
+# (transport_poll_write(0) → WS disconnect + re-greet) and `wifi:m f null` frame
+# drops. Moving them to PSRAM (3 MB free) fixes both. Screen benchmarked clean
+# with this on (WiFi traffic is tiny next to the panel's ~27 MB/s framebuffer
+# bandwidth). DYNAMIC_RX_BUFFER_NUM bumped 32→64 to absorb agent-audio bursts;
+# cheap now that these live in PSRAM. Also: cJSON is pointed at PSRAM in code
+# (main.c cJSON_InitHooks) and the PCM ring is 512 KB PSRAM (convai.c) — same
+# theme: keep big/frequent allocations OUT of internal SRAM. Do not revert.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+
 # Our UI needs these fonts; Travis's project doesn't.
 CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_20=y

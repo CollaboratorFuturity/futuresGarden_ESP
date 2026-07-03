@@ -322,7 +322,22 @@ static void handle_uid(const uint8_t *uid, int len)
         return;
     }
     orb_ui_set_state(ORB_LOADING);   // yellow + sweep: WSS connecting
-    convai_start(agent);
+    // convai_start tears itself down and returns false if a required task can't
+    // spawn; retry a couple of times rather than wedging on ORB_LOADING. On
+    // final failure drop back to ORB_MUTED so the idle window (and NFC polling)
+    // returns and the user can re-scan to try again.
+    bool started = false;
+    for (int attempt = 1; attempt <= 3 && !started; attempt++) {
+        started = convai_start(agent);
+        if (!started) {
+            ESP_LOGE(PN532_TAG, "convai_start attempt %d/3 failed; retrying", attempt);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+    if (!started) {
+        ESP_LOGE(PN532_TAG, "convai_start failed after 3 attempts — back to idle");
+        orb_ui_set_state(ORB_MUTED);
+    }
 }
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────

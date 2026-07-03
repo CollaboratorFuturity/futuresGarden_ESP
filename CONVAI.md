@@ -43,7 +43,7 @@ Most of our reliability features are direct ports of Pi behaviour.
         │                                            base64 decode (1 KB) │
         │                                                          │      │
         │                                                          ▼      │
-        │                                              PCM ring (128 KB)  │
+        │                                              PCM ring (512 KB)  │
         │                                                          │      │
         │                                                          ▼      │
         │                                          playback_task ──► I2S  │
@@ -117,7 +117,7 @@ Most of our reliability features are direct ports of Pi behaviour.
 | Buffer | Size | Pool | Created in | Notes |
 |---|---|---|---|---|
 | WS reassembly buf | 2 MB | PSRAM | `convai_start` | Holds incoming fragmented WS messages. Single agent audio events have been seen at 250+ KB; this is sized for ~30 s of monologue worst case. |
-| PCM ring (`s_pcm`) | 128 KB | PSRAM (static stream buffer) | `convai_start` | Between WS receive and speaker write. ~4 s of audio at 32 KB/s drain rate. Backpressure (`portMAX_DELAY`) means oversized audio events just slow the WS task — never overflow. |
+| PCM ring (`s_pcm`) | **512 KB** (was 128 KB) | PSRAM (static stream buffer) | `convai_start` | Between WS receive and speaker write. ~16 s at 32 KB/s drain. Backpressure (`portMAX_DELAY`) means a full ring **blocks the WS task** — which is exactly the trap: too small → the WS task blocks mid-turn, stops draining the socket, and WiFi RX starves (`wifi:m f null`). 512 KB holds ~a whole turn so it doesn't block. See "Audio receive back-pressure" below. |
 | Send queue (`s_queue`) | 1 MB | PSRAM (static ringbuffer NOSPLIT) | `convai_start` | ~24 s of mic audio at 43 KB/s outbound rate. FIFO, item-oriented. Producer (`mic_task`) blocks on full, never drops. |
 | Mic PCM buffer | 960 B | PSRAM | `convai_start` | One I2S frame (30 ms × 16 kHz × 2 B). |
 | Mic base64 buffer | 1284 B | PSRAM | `convai_start` | Encoded form of one frame. |
@@ -347,12 +347,37 @@ All in `convai.c` near the `mic_task` definition.
 | `PTT_PRESS_MIN_MS` | 1000 | Press < 1 s → silent revert (no turn end sent) |
 | `PTT_TAIL_SILENCE_FRAMES` | 43 (~1290 ms) | Must exceed the server's VAD silence threshold + jitter margin |
 | `PTT_SHORT_TURN_MIN_MS` | 800 | Real audio < 800 ms → skip waiting for response, but DO send the pad to close the turn server-side |
-| `PTT_STALE_TURN_WARN_MS` | 8000 | Watchdog: warn if PTT closed > 8 s ago and nothing but pings has arrived |
+| `PTT_STALE_TURN_WARN_MS` | 8000 | Stale-turn watchdog stage 1 (nudge) — see below |
+| `PTT_STALE_TURN_RECOVER_MS` | 16000 | Stale-turn watchdog stage 2 (give up → `ORB_MUTED`) |
 
 The pad / VAD relationship matters: the initiation message also pins
 `turn_detection.silence_duration_ms = 800` on the server side, so our
 1290 ms pad gives ~490 ms margin over the threshold. Don't shorten
 the pad without lowering the server threshold to match.
+
+### Stale-turn recovery (the fix for "stuck on ORB_LOADING forever")
+The server occasionally **misses the end-of-turn**: it got the full turn (mic frames + tail
+pad; queue healthy, `q_depth=0 q_block=0 q_retry=0`) but never emits a response, only `ping`.
+The only exit from `ORB_LOADING` is an incoming agent response, so without recovery the orb
+hangs. Diagnostic tell: WS stays `up`, uptime climbs (not a crash/disconnect), no
+`not valid JSON` (rules out a heap-starved dropped RX parse — the send path is PSRAM so low
+`heap_int` doesn't touch it). The `heartbeat_task` watchdog is **two-stage, both one-shot**,
+keyed off `s_ptt_close_us` (cleared by `process_message` on any non-ping/pong event, cancelling
+whichever stage hasn't fired):
+- **Stage 1 — nudge (`PTT_STALE_TURN_WARN_MS` = 8 s):** re-send the tail pad to re-trigger the
+  server VAD (harmless if the turn was merely slow — trailing silence is ignored). 8 s of
+  ping-only traffic is a near-certain real miss (cold-start responses can take ~10 s, but they
+  send *something*).
+- **Stage 2 — give up (`PTT_STALE_TURN_RECOVER_MS` = 16 s):** revert UI to `ORB_MUTED` + clear
+  the watchdog so the orb is usable, instead of frozen. 16 s is past the ~10 s cold-start max,
+  so a slow-but-valid turn is never aborted; a late response still flips the UI to `ORB_AGENT`.
+- **The nudge is routed through `mic_task`**, not sent from `heartbeat_task`: heartbeat only sets
+  `s_pad_resend_request`; `mic_task` consumes it at the top of its loop and only when idle
+  (`!open && !ptt`), keeping every `send_silence_frames`/`s_mic_pcm` access on the buffers'
+  owning task. Don't move the resend off `mic_task`.
+- All three flags (`s_stale_warned`, `s_stale_recovered`, `s_pad_resend_request`) reset at every
+  `s_ptt_close_us` arming site: PTT real-turn close, NFC inject (`convai_send_user_message`), and
+  real-response arrival — so **NFC injects get the same recovery for free**.
 
 ---
 
@@ -369,8 +394,11 @@ continues. This is the one place we feed the agent user input that isn't mic aud
    (so quotes / UTF-8 are escaped) and **direct-sent** (not via the mic queue), same
    class as `pong` / `user_activity` / `send_initiation`. One-shot, too infrequent to
    drive the lib's fail-fast.
-2. **A turn-end pad** — immediately after the text we push `PTT_TAIL_SILENCE_FRAMES`
-   of zero audio through the queue (the same pad a PTT release sends).
+2. **A turn-end pad** — immediately after the text we push up to `PTT_TAIL_SILENCE_FRAMES`
+   of zero audio through the queue (the same pad a PTT release sends), but **abortable**:
+   `send_silence_frames(n, /*abortable=*/true)` stops the instant the agent's audio starts
+   arriving (`s_turn_response_started`, set in `handle_audio_event`). See "Why the pad is
+   abortable" below.
 
 **Why part 2 is not optional (the bug we hit and fixed):** the session runs
 **server-side VAD turn detection on the audio stream** (`turn_detection.silence_duration_ms`).
@@ -394,12 +422,33 @@ If you instead see `user_message injected` followed by **only pings** (`rx_2s` s
 ping size, no `audio`/`agent_response`), the turn-end didn't land — check that the pad is
 still being sent.
 
+**Why the pad is abortable (the WS-disconnect bug):** `esp_websocket_client` guards send
+**and** receive with a single recursive mutex (`client->lock`). The WS task holds it through
+`esp_websocket_client_recv()` → `esp_transport_read()` → **dispatching `WEBSOCKET_EVENT_DATA`
+to our handler**. `handle_audio_event` then blocks on `xStreamBufferSend(s_pcm, …, portMAX_DELAY)`
+paced to the speaker's ~32 KB/s drain, so during an agent audio turn the WS task holds the lock
+for *seconds*. If `sender_task` (a different task) is still pushing pad frames when the agent's
+audio starts, its `send_text` can't get the lock → times out → the pad backs up → a congested
+write returns 0 → the lib aborts the connection (**WS disconnect + re-greet**). The fix: stop
+the pad the instant agent audio arrives. It's safe because the agent only responds *after* the
+server closed the turn, so enough silence already went out; the remaining frames were pointless.
+This is why a full-length inject pad must **not** be restored. (Note: **pong is NOT part of this**
+— it's sent from `process_message` on the WS task itself, so it re-enters the recursive mutex for
+free and never contends. An earlier hypothesis blaming pong was wrong.)
+
 **Guards / ownership:** `convai_send_user_message` returns false (no-op) if the WS is
 down, no session is running, or `s_ptt_held` is true. The PTT guard matters because the
 pad reuses `s_mic_pcm` via `send_silence_frames`, which `mic_task` also owns during a
 press; the §6.4 NFC gate (scan only in `ORB_MUTED`) already guarantees PTT is idle, but
-the guard is belt-and-suspenders. The call blocks ~1.29 s (the pad is paced at 30 ms/frame)
-in `nfc_task`, which is fine — NFC polling is suppressed during `ORB_LOADING` anyway.
+the guard is belt-and-suspenders. The abortable pad runs in `nfc_task` and returns as soon
+as the agent responds (or after the full ~1.29 s if it doesn't) — fine, NFC polling is
+suppressed during `ORB_LOADING` anyway.
+
+> **One known latent issue still here** (tracked in [PROGRESS.md](PROGRESS.md) "Still pending"):
+> the entry `s_ptt_held` guard only covers the *start* of the call, so a PTT press mid-pad could
+> still race the shared `s_mic_pcm` buffers. The clean fix is to route the pad through `mic_task`
+> via a flag (BEHAVIOR.md §3.5) instead of `nfc_task`. Not urgent — the §6.4 gate makes it hard
+> to hit and neither the crash nor the disconnect depended on it.
 
 ---
 
@@ -491,6 +540,59 @@ When things go wrong, in order:
    frozen — different bug, see SCREEN.md.
 
 ---
+
+## Audio receive back-pressure & the single-recursive-lock trap
+
+This subsystem caused a long, confusing failure cascade (hard reset → WS disconnect →
+`wifi:m f null`) that all traced back to **one structural fact plus internal-SRAM scarcity**.
+Read this before touching the receive path.
+
+**The structural fact:** `esp_websocket_client` guards **send and receive with one recursive
+mutex** (`client->lock`). The WS task holds it through `esp_websocket_client_recv()` →
+`esp_transport_read()` → **dispatching `WEBSOCKET_EVENT_DATA` to our handler**. Our
+`handle_audio_event` then chunk-decodes base64 and **blocks** on
+`xStreamBufferSend(s_pcm, …, portMAX_DELAY)` paced to the 32 KB/s speaker. So **during an agent
+audio turn the WS task holds the lock for seconds and stops draining the socket.** Consequences,
+in the order we discovered/fixed them:
+
+1. **Any other task's send times out** (`Could not lock ws-client within 50 timeout`) — the
+   NFC-inject silence pad on `sender_task` backs up. (Pong is fine: it runs on the WS task
+   itself, re-entering the recursive mutex for free — an early "skip pong" hypothesis was wrong.)
+2. **The blocked WS task stops reading** → inbound TCP + WiFi RX buffers pile up in **internal
+   SRAM** → `transport_poll_write(0)` on our next send (no send pbuf) → **WS disconnect**, and
+   the WiFi driver drops frames (`wifi:m f null`).
+
+**What we changed (all "keep big/frequent allocs in PSRAM", see CLAUDE.md "Memory" section):**
+- **PCM ring 128 KB → 512 KB PSRAM** — the WS task can now dump a whole turn without blocking on
+  the speaker, so it goes right back to reading. (Comment at `PCM_RING_BYTES` documents this.)
+- **WiFi/lwIP → PSRAM** (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`) + **cJSON → PSRAM** (`main.c`) —
+  so the pile-up doesn't exhaust internal SRAM; the TCP send path always has buffers → no more
+  disconnect, `heap_int` stays healthy instead of hitting 0.
+- **Inject pad is abortable** — stops the instant agent audio starts (`s_turn_response_started`),
+  so it doesn't fight the lock (see "Text injection" above).
+- **`WS_RECONNECT_DELAY_MS` 5000 → 1500** — if a genuine disconnect still happens (WiFi/ECONNRESET),
+  recovery is ~2 s instead of ~8 s.
+
+**Result:** verified stable over 10 back-to-back NFC injects / 160 s — no reset, no disconnect,
+no conversation drop. Residual `wifi:m f null` on *very* long single turns is cosmetic (dropped
+frames → TCP retransmit → minor jitter).
+
+### Deferred: decode-decouple refactor (the full cure for the residual jitter)
+The residual `m f null` on long turns is the **base64 decode being CPU-bound on the WS task** —
+even with a big ring, decoding a 269 KB message holds the lock / blocks socket reads for tens of
+ms. The full cure: move decode + PCM-push into a new `decode_task`; the WS task only reassembles
++ hands off raw bytes and immediately keeps reading. **~150–250 LOC, ~1–2 days, HIGH regression
+risk** on the two most fragile paths:
+- **Interruption race:** `interruption` does `xStreamBufferReset(s_pcm)` on the WS task; with a
+  decode task that races the decode task's `xStreamBufferSend` on the same stream buffer — needs
+  a mutex (stream buffers aren't safe for concurrent reset+send).
+- **End-of-turn ordering:** `agent_response`→`s_agent_done_signal` (WS task) must be sequenced
+  *after* the decode task drains that turn's audio into the ring (via a queue sentinel), else
+  playback flips `ORB_AGENT`→`ORB_MUTED` early and **clips the last word**, or waits out the 10 s
+  safety timer. This is the hard-won state machine — highest-value thing not to regress.
+
+Not needed to ship (current build is stable and only jitters on pathologically long turns). Do it
+post-launch only if the jitter bugs users. Full risk analysis lived in the plan file for this work.
 
 ## Deferred: resume the conversation on reconnect (`conversation_id`)
 
