@@ -51,6 +51,7 @@ static const OrbStateStyle STATE_STYLE[] = {
     [ORB_MUTED]     = { 0x2A2A2A, "Press\nto talk" },
     [ORB_LOW_BAT]   = { 0xC0392B, "Low battery" },
     [ORB_ERROR]     = { 0xC0392B, "ERROR\nRestart the Orb." },
+    [ORB_RETRY]     = { 0xCB6D2E, "No response\nPlease repeat" },
     [ORB_NFC]       = { 0x7B2FA8, "NFC\nScanned" },
 };
 
@@ -183,6 +184,7 @@ static void apply_state(OrbState s)
         case ORB_USER_TALK: pulse = &PULSE_TALK;  break;
         case ORB_AGENT:     pulse = &PULSE_AGENT; break;
         case ORB_MUTED:     pulse = &PULSE_MUTED; break;
+        case ORB_RETRY:     pulse = &PULSE_MUTED; break;   // calm breath, like idle
         case ORB_ERROR:     pulse = &PULSE_ERROR; break;
         default: break;
     }
@@ -418,7 +420,9 @@ void orb_ui_set_state(OrbState s)
     // is the single point every module routes turn transitions through, which
     // makes it the natural choke point for this. (NFC_Set_Polling just flips a
     // volatile flag — safe from any task/context.)
-    NFC_Set_Polling(s == ORB_MUTED);
+    // ORB_RETRY (stale-turn give-up prompt) is an idle-equivalent window: the
+    // user hasn't started a turn, so NFC scanning is allowed there too.
+    NFC_Set_Polling(s == ORB_MUTED || s == ORB_RETRY);
 }
 
 void orb_ui_set_agent_name(const char *name)

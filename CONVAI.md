@@ -146,10 +146,12 @@ stack anywhere, take it from PSRAM via `xTaskCreatePinnedToCoreWithCaps`.
 ### Why it exists
 
 Pre-queue, `mic_task` called `esp_websocket_client_send_text` directly
-every 30 ms. The lib's internal `transport_poll_write` uses a timeout
-(`network_timeout_ms = 10000`); if a single write doesn't get the socket
-writable within that window, the lib treats it as transport failure,
-fires `WEBSOCKET_EVENT_DISCONNECTED`, and auto-reconnects. Auto-reconnect
+every 30 ms. The lib's internal `transport_poll_write` uses the timeout
+passed to `send_text` (**`SEND_TEXT_TIMEOUT_MS`**, NOT `network_timeout_ms`
+— confirmed on hardware: failures land at `tx_age≈SEND_TEXT_TIMEOUT_MS`);
+if a single write doesn't get the socket writable within that window, the
+lib treats `poll_write`-returned-0 as transport failure, fires
+`WEBSOCKET_EVENT_DISCONNECTED`, and auto-reconnects. Auto-reconnect
 re-runs `send_initiation`, which the server interprets as a *new
 conversation*, and we hear the agent greeting from scratch — what we
 were calling "the conversation restarts mid-PTT."
@@ -158,7 +160,7 @@ Three distinct root causes, all converging on the same symptom:
 
 | Failure mode | Cause | Preventable? |
 |---|---|---|
-| `transport_poll_write(0)` | TCP send buffer full, kernel can't accept more bytes | **Yes** — the queue absorbs the back-pressure so we never feed the lib a failing write |
+| `transport_poll_write(0)` | Socket not writable within `SEND_TEXT_TIMEOUT_MS` (TCP send buffer full — worst on the first turn, fresh conn in slow-start right after the greeting download) | **Yes, but NOT by the queue** — the disconnect happens *inside* the send call, before retry logic runs. Fixed by raising `SEND_TEXT_TIMEOUT_MS` 500→5000 so `sender_task` rides out the congestion (queue absorbs the backlog). See CLAUDE.md send-queue section. |
 | `errno=104 (ECONNRESET)` | Server (or middlebox) actively closed | No — link is gone, queue can't help. We just don't *cause* it. |
 | WiFi STA reassociation | Underlying physical layer dropped | No — same as above |
 
@@ -348,7 +350,7 @@ All in `convai.c` near the `mic_task` definition.
 | `PTT_TAIL_SILENCE_FRAMES` | 43 (~1290 ms) | Must exceed the server's VAD silence threshold + jitter margin |
 | `PTT_SHORT_TURN_MIN_MS` | 800 | Real audio < 800 ms → skip waiting for response, but DO send the pad to close the turn server-side |
 | `PTT_STALE_TURN_WARN_MS` | 8000 | Stale-turn watchdog stage 1 (nudge) — see below |
-| `PTT_STALE_TURN_RECOVER_MS` | 16000 | Stale-turn watchdog stage 2 (give up → `ORB_MUTED`) |
+| `PTT_STALE_TURN_RECOVER_MS` | 16000 | Stale-turn watchdog stage 2 (give up → `ORB_RETRY` prompt + double beep) |
 
 The pad / VAD relationship matters: the initiation message also pins
 `turn_detection.silence_duration_ms = 800` on the server side, so our
@@ -368,9 +370,16 @@ whichever stage hasn't fired):
   server VAD (harmless if the turn was merely slow — trailing silence is ignored). 8 s of
   ping-only traffic is a near-certain real miss (cold-start responses can take ~10 s, but they
   send *something*).
-- **Stage 2 — give up (`PTT_STALE_TURN_RECOVER_MS` = 16 s):** revert UI to `ORB_MUTED` + clear
-  the watchdog so the orb is usable, instead of frozen. 16 s is past the ~10 s cold-start max,
-  so a slow-but-valid turn is never aborted; a late response still flips the UI to `ORB_AGENT`.
+- **Stage 2 — give up (`PTT_STALE_TURN_RECOVER_MS` = 16 s):** show `ORB_RETRY` ("No response /
+  Please repeat", warm amber `0xCB6D2E`) + a double 350 Hz beep (`i2s_audio_beep` ×2, 70 ms gap)
+  + clear the watchdog, so the orb is usable instead of frozen. `ORB_RETRY` is idle-equivalent
+  (PTT + NFC both work; `NFC_Set_Polling` gates on `ORB_MUTED || ORB_RETRY`) and persists until
+  the user retries — a press flips to `ORB_USER_TALK`. 16 s is past the ~10 s cold-start max, so a
+  slow-but-valid turn is never aborted; a late response still flips the UI to `ORB_AGENT`. (Not to
+  be confused with the red `ORB_ERROR` "Restart the Orb", which is fatal.) The beep is safe from
+  `heartbeat_task`: the PCM ring is empty at give-up (no playback contends) and it does no
+  TLS/heap work. **Faster detection via `user_transcript` + an adaptive first-turn-vs-warm timeout
+  are the planned follow-ups — see PROGRESS.md** (gated on verifying the ElevenLabs event order).
 - **The nudge is routed through `mic_task`**, not sent from `heartbeat_task`: heartbeat only sets
   `s_pad_resend_request`; `mic_task` consumes it at the top of its loop and only when idle
   (`!open && !ptt`), keeping every `send_silence_frames`/`s_mic_pcm` access on the buffers'

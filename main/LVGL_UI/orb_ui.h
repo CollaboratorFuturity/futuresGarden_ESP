@@ -16,6 +16,7 @@ typedef enum {
     ORB_MUTED,
     ORB_LOW_BAT,
     ORB_ERROR,
+    ORB_RETRY,
     ORB_NFC,
 } OrbState;
 

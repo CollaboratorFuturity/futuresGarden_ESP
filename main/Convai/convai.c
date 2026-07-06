@@ -102,7 +102,21 @@ static TaskHandle_t         s_sender_task    = NULL;
 // will run slightly behind realtime during sustained outages.
 #define SEND_QUEUE_BYTES         (1 * 1024 * 1024)
 #define SEND_RETRY_BACKOFF_MS    500
-#define SEND_TEXT_TIMEOUT_MS     500
+// Timeout passed to esp_websocket_client_send_text — it propagates to the
+// transport's poll_write. At 500 ms it was a hair-trigger: on the FIRST user
+// turn (right after the ~200-330 KB greeting download, on a fresh TCP conn
+// still in slow-start), the uplink can't absorb the 43 KB/s mic burst within
+// 500 ms → transport_poll_write returns 0 (timeout, NOT a real error:
+// transport_error=ESP_OK, esp_tls_err/sock_errno uninitialized) → the WS lib
+// treats the zero-length write as a dead transport and DISCONNECTS + re-greets.
+// Observed ~65% of boots, sometimes 5 reconnects before a turn stuck. The
+// send queue can't prevent it — the disconnect happens INSIDE the send call,
+// before our retry logic runs. Raising the timeout lets sender_task ride out
+// the transient congestion instead; the 1 MB PSRAM queue absorbs the mic
+// backlog while a send blocks (q_depth grows, no frames dropped), and a longer
+// timeout only bites when actually congested. Kept under WS_NETWORK_TIMEOUT_MS
+// (10 s) so a genuinely dead transport is still caught by the lib's own timeout.
+#define SEND_TEXT_TIMEOUT_MS     5000
 static uint8_t            *s_queue_storage = NULL;
 static StaticRingbuffer_t  s_queue_struct;
 static RingbufHandle_t     s_queue = NULL;
@@ -641,6 +655,21 @@ static void process_message(const char *data, int len)
     // Anything other than the keepalive cadence counts as "server is
     // responding to our turn" — clear the stale-turn watchdog.
     if (strcmp(type_str, "ping") != 0 && strcmp(type_str, "pong") != 0) {
+        // DIAGNOSTIC (for the "lower the recovery time" investigation, PROGRESS.md):
+        // log the FIRST server event after a PTT close and how long it took.
+        // s_ptt_close_us is non-zero only for that first event (cleared just
+        // below), so this fires once per turn. Gathered over many turns it
+        // answers: is `user_transcript` reliably the first event, and how far
+        // ahead of the 16 s give-up does it land? If it's consistently first
+        // and early, recovery can key off its ABSENCE instead of waiting 16 s.
+        int64_t pclose = s_ptt_close_us;
+        if (pclose > 0) {
+            ESP_LOGI(TAG, "turn: 1st server event after PTT close = %s at +%lldms "
+                          "(recover timeout is %d ms)",
+                     type_str,
+                     (long long)((esp_timer_get_time() - pclose) / 1000),
+                     PTT_STALE_TURN_RECOVER_MS);
+        }
         s_ptt_close_us = 0;
         s_stale_warned = false;
         s_stale_recovered = false;
@@ -1010,17 +1039,28 @@ static void heartbeat_task(void *arg)
                 s_stale_warned = true;
             }
             // Stage 2 — give up: nudge didn't land. Don't leave the user
-            // staring at a frozen ORB_LOADING; revert to ORB_MUTED and clear
-            // the watchdog so the next press is a clean turn. Safe even if a
-            // late response arrives — its audio will flip the UI to ORB_AGENT.
+            // staring at a frozen ORB_LOADING; show ORB_RETRY ("No response /
+            // Please repeat") and clear the watchdog. ORB_RETRY is an idle-
+            // equivalent state (PTT + NFC both work), so it persists until the
+            // user presses to try again — a press flips the UI to ORB_USER_TALK
+            // normally. Safe even if a late response arrives — its audio will
+            // flip the UI to ORB_AGENT.
             if (age_ms > PTT_STALE_TURN_RECOVER_MS && !s_stale_recovered) {
                 ESP_LOGW(TAG, "TURN STALE: %lldms, no response after nudge — "
-                              "giving up, reverting to idle so the orb is usable.",
+                              "giving up, prompting user to repeat (ORB_RETRY).",
                          (long long)age_ms);
                 s_stale_recovered = true;
                 s_pad_resend_request = false;
                 s_ptt_close_us = 0;
-                orb_ui_set_state(ORB_MUTED);
+                orb_ui_set_state(ORB_RETRY);
+                // Audible cue so the user notices even if not looking at the
+                // orb: the NFC blopp's top tone (350 Hz) played twice in quick
+                // succession. i2s_audio_beep is synchronous, so the vTaskDelay
+                // gives a clean gap between the two beeps. Safe here — the PCM
+                // ring is empty (no response arrived), so no playback contends.
+                i2s_audio_beep(350, 90);
+                vTaskDelay(pdMS_TO_TICKS(70));
+                i2s_audio_beep(350, 90);
             }
         }
     }
