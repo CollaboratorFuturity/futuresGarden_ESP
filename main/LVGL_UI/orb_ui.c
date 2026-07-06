@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #include "nfc.h"
+#include "esp_app_desc.h"   // esp_app_get_description()->version (git-describe tag)
 
 #define ORB_CIRCLE_DIAM     200
 #define ORB_NAME_Y          60        // top-mid, above the central circle
@@ -40,7 +41,7 @@ typedef struct {
 static const OrbStateStyle STATE_STYLE[] = {
     [ORB_BOOT]      = { 0x404040, "Booting" },
     [ORB_WIFI]      = { 0x404040, "Connecting\nWiFi" },
-    [ORB_CONFIG]    = { 0x404040, "Fetching\nconfig\n(v2)" },
+    [ORB_CONFIG]    = { 0x404040, "Fetching\nconfig" },   // version appended at runtime (see s_config_label)
     [ORB_CHECK_UPD] = { 0x404040, "Checking\nfor updates" },
     [ORB_UPDATING]  = { 0x404040, "Updating" },
     [ORB_WIFI_FAIL] = { 0xC0392B, "No WiFi. Check\nrouter & restart" },
@@ -57,6 +58,11 @@ static const OrbStateStyle STATE_STYLE[] = {
 
 static lv_obj_t *s_circle;
 static lv_obj_t *s_circle_label;
+// ORB_CONFIG label is built at init to include the running firmware version
+// (git-describe tag, e.g. "v0.1.1") so the installed release is visible
+// on-screen during config fetch — updates after an OTA are confirmable at a
+// glance. Replaces the old hardcoded "(v2)" tell.
+static char      s_config_label[48];
 static lv_obj_t *s_name_label;
 static lv_obj_t *s_battery_label;
 
@@ -160,7 +166,11 @@ static void apply_state(OrbState s)
     const OrbStateStyle *st = &STATE_STYLE[s];
     lv_color_t c = lv_color_hex(st->color);
     lv_obj_set_style_bg_color(s_circle, c, LV_PART_MAIN);
-    lv_label_set_text(s_circle_label, st->label);
+    // ORB_CONFIG shows the running firmware version (built in orb_ui_init);
+    // every other state uses its static table label.
+    const char *label = (s == ORB_CONFIG && s_config_label[0]) ? s_config_label
+                                                               : st->label;
+    lv_label_set_text(s_circle_label, label);
 
     // Sweeping arc lives outside the central circle during the three
     // "working" states. Hidden + animation deleted in every other state so
@@ -320,6 +330,14 @@ static void orb_tick_cb(lv_timer_t *t)
 
 void orb_ui_init(void)
 {
+    // Build the ORB_CONFIG label with the running firmware version once. The
+    // version is the git-describe tag baked at build time (e.g. "v0.1.1"),
+    // the same string OTA compares against — so what's on screen == what's
+    // installed. Falls back to a blank version if the app desc is unavailable.
+    const esp_app_desc_t *app = esp_app_get_description();
+    snprintf(s_config_label, sizeof(s_config_label), "Fetching\nconfig\n%s",
+             (app && app->version[0]) ? app->version : "");
+
     lv_obj_t *scr = lv_scr_act();
     lv_obj_remove_style_all(scr);
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x160424), LV_PART_MAIN);   // bg.primary
