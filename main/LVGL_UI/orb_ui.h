@@ -15,7 +15,8 @@ typedef enum {
     ORB_AGENT,
     ORB_MUTED,
     ORB_LOW_BAT,
-    ORB_ERROR,
+    ORB_ERROR,     // genuine device-side wedge — "Restart the Orb" (reserved)
+    ORB_NO_NET,    // has WiFi+IP but can't reach the cloud — "Check WiFi" (auto-retries)
     ORB_RETRY,
     ORB_NFC,
 } OrbState;

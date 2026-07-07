@@ -44,7 +44,7 @@ static const OrbStateStyle STATE_STYLE[] = {
     [ORB_CONFIG]    = { 0x404040, "Fetching\nconfig" },   // version appended at runtime (see s_config_label)
     [ORB_CHECK_UPD] = { 0x404040, "Checking\nfor updates" },
     [ORB_UPDATING]  = { 0x404040, "Updating" },
-    [ORB_WIFI_FAIL] = { 0xC0392B, "No WiFi. Check\nrouter & restart" },
+    [ORB_WIFI_FAIL] = { 0xC0392B, "No WiFi\nCheck router" },
     [ORB_SPLASH]    = { 0x2A2A2A, "Ready" },
     [ORB_LOADING]   = { 0xC47A0C, "Loading" },
     [ORB_USER_TALK] = { 0x27AE60, "Listening" },
@@ -52,6 +52,7 @@ static const OrbStateStyle STATE_STYLE[] = {
     [ORB_MUTED]     = { 0x2A2A2A, "Press\nto talk" },
     [ORB_LOW_BAT]   = { 0xC0392B, "Low battery" },
     [ORB_ERROR]     = { 0xC0392B, "ERROR\nRestart the Orb." },
+    [ORB_NO_NET]    = { 0xC0392B, "No internet\nCheck WiFi" },
     [ORB_RETRY]     = { 0xCB6D2E, "No response\nPlease repeat" },
     [ORB_NFC]       = { 0x7B2FA8, "NFC\nScanned" },
 };
@@ -196,6 +197,8 @@ static void apply_state(OrbState s)
         case ORB_MUTED:     pulse = &PULSE_MUTED; break;
         case ORB_RETRY:     pulse = &PULSE_MUTED; break;   // calm breath, like idle
         case ORB_ERROR:     pulse = &PULSE_ERROR; break;
+        case ORB_NO_NET:    pulse = &PULSE_ERROR; break;
+        case ORB_WIFI_FAIL: pulse = &PULSE_ERROR; break;
         default: break;
     }
     apply_circle_pulse(pulse);

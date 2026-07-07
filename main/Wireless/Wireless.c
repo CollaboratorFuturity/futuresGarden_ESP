@@ -5,6 +5,8 @@
 
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_system.h"   // esp_reset_reason()
+#include "esp_timer.h"    // esp_timer_get_time() — WiFi-fail grace timer
 #include "orb_ui.h"
 #include "config_fetch.h"
 #include "i2s_audio.h"
@@ -34,6 +36,15 @@ static int  s_cur_cred = -1;                                  // index being att
 static bool s_auth_failed[sizeof(s_creds) / sizeof(s_creds[0])] = { false };  // skip this boot (bad pw)
 static TaskHandle_t s_wifi_mgr = NULL;                        // runs scan+select off the event task
 
+// WiFi-fail grace: on router-off / out-of-range / dead-AP, disconnects fire
+// with reason=201 (NO_AP_FOUND) forever and we just keep rescanning — the UI
+// used to sit on "Connecting WiFi" indefinitely with no indication. After this
+// long with no association we flip to ORB_WIFI_FAIL ("No WiFi / Check router")
+// while STILL rescanning underneath, so it clears itself the moment the router
+// returns. The grace period avoids alarming on a normal few-second connect.
+#define WIFI_FAIL_GRACE_MS   30000
+static int64_t s_connecting_since_us = 0;   // start of the current not-connected streak; 0 while connected
+
 // Cache of the fetched agent identity, exposed via orb_get_agent_id/name.
 // Populated once by post_connect_task after orb_config_fetch returns.
 static char s_agent_id[64]   = {0};
@@ -61,6 +72,31 @@ bool orb_refresh_config(void)
     return true;
 }
 
+// Human-readable last-reset cause. The ROM prints the reset reason over
+// USB-serial at boot, but audio_init kills USB before the UDP sink comes up —
+// so without this the cause of a mid-session reboot is invisible over UDP.
+// esp_reset_reason() latches the cause of THIS boot's reset, so logging it the
+// instant UDP is live tells us why the orb last died: BROWNOUT (power/rail sag,
+// e.g. under bad-WiFi radio current + loud audio) vs PANIC / TASK_WDT / INT_WDT
+// (a real software crash) vs SW/EXT/POWERON (clean).
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+        case ESP_RST_POWERON:  return "POWERON (clean cold boot)";
+        case ESP_RST_SW:       return "SW (esp_restart)";
+        case ESP_RST_EXT:      return "EXT (external pin)";
+        case ESP_RST_PANIC:    return "PANIC (software crash/abort)";
+        case ESP_RST_INT_WDT:  return "INT_WDT (interrupt watchdog)";
+        case ESP_RST_TASK_WDT: return "TASK_WDT (task watchdog)";
+        case ESP_RST_WDT:      return "WDT (other watchdog)";
+        case ESP_RST_BROWNOUT: return "BROWNOUT (supply voltage sag)";
+        case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+        case ESP_RST_USB:      return "USB";
+        case ESP_RST_JTAG:     return "JTAG";
+        default:               return "UNKNOWN";
+    }
+}
+
 static void post_connect_task(void *arg)
 {
     // UDP log sink FIRST — audio_init has already killed USB-CDC by the
@@ -68,6 +104,10 @@ static void post_connect_task(void *arg)
     // `convai_start` would otherwise be invisible. Catch all of it on UDP.
     log_sink_start(6666);
     ESP_LOGI(WIFI_TAG, "post_connect_task: UDP sink up");
+    // Why did we (re)boot? Load-bearing for diagnosing mid-session reboots
+    // over UDP — a BROWNOUT here means power, a PANIC/WDT means our code.
+    esp_reset_reason_t rr = esp_reset_reason();
+    ESP_LOGW(WIFI_TAG, "last reset reason: %s (code=%d)", reset_reason_str(rr), (int)rr);
 
     // SNTP must come before any TLS — cert validation needs the clock.
     orb_sntp_sync(15000);
@@ -85,33 +125,55 @@ static void post_connect_task(void *arg)
 
     orb_ui_set_state(ORB_CONFIG);
 
-    if (orb_refresh_config()) {
-        ESP_LOGI(WIFI_TAG, "post_connect_task: config OK; starting convai");
-        // Auto-start the conversation. No idle SPLASH state any more —
-        // the device goes straight from CONFIG to LOADING → agent greeting.
-        // NFC scans still restart the session (see nfc.c::handle_uid).
-        orb_ui_set_state(ORB_LOADING);
-        // convai_start returns false if a required task (e.g. playback) can't
-        // spawn — it fully tears itself down in that case, so a retry gets a
-        // fresh attempt against a heap that may have settled differently.
-        // Bounded so a genuinely unrecoverable condition can't spin forever.
-        bool started = false;
-        for (int attempt = 1; attempt <= 3 && !started; attempt++) {
-            started = convai_start(s_agent_id);
-            if (!started) {
-                ESP_LOGE(WIFI_TAG, "convai_start attempt %d/3 failed; retrying", attempt);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
+    // Config fetch is the gateway to everything (agent id, volume). A single
+    // HTTP timeout on flaky WiFi used to strand the orb on "Fetching config"
+    // FOREVER — this task just logged "config fetch failed" and exited, so the
+    // only recoveries were a manual NFC scan (needs the PN532) or a reboot.
+    // Retry with exponential backoff instead, so a transient outage self-heals
+    // the instant WiFi returns, with no user action. The backoff (2s → 30s cap)
+    // also avoids a tight retry loop hammering the radio during a bad-WiFi
+    // stretch. UI stays on ORB_CONFIG ("Fetching config") throughout — honest,
+    // and it shows the running version so a wedged orb is still identifiable.
+    {
+        int attempt = 0, backoff_ms = 2000;
+        while (!orb_refresh_config()) {
+            attempt++;
+            ESP_LOGW(WIFI_TAG, "config fetch failed (attempt %d) — retrying in %d ms",
+                     attempt, backoff_ms);
+            // Persistent failure (2+ consecutive) → show ORB_NO_NET
+            // ("No internet / Check WiFi"). By this point WiFi is associated and
+            // we have an IP (post_connect runs after association), so the only
+            // thing failing is the cloud/internet path — restarting would just
+            // re-run the same failing fetch, so we point the user at WiFi, not a
+            // restart. We KEEP retrying underneath, so it clears and proceeds on
+            // its own when the link returns. (First failure stays on ORB_CONFIG
+            // to avoid flashing the screen on a single transient timeout.)
+            if (attempt == 2) orb_ui_set_state(ORB_NO_NET);
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            if (backoff_ms < 30000) backoff_ms *= 2;
         }
+    }
+    ESP_LOGI(WIFI_TAG, "post_connect_task: config OK; starting convai");
+
+    // Auto-start the conversation. No idle SPLASH state any more —
+    // the device goes straight from CONFIG to LOADING → agent greeting.
+    // NFC scans still restart the session (see nfc.c::handle_uid).
+    orb_ui_set_state(ORB_LOADING);
+    // convai_start returns false if a required task (e.g. playback) can't
+    // spawn — it fully tears itself down in that case, so a retry gets a
+    // fresh attempt against a heap that may have settled differently.
+    // Bounded so a genuinely unrecoverable condition can't spin forever.
+    bool started = false;
+    for (int attempt = 1; attempt <= 3 && !started; attempt++) {
+        started = convai_start(s_agent_id);
         if (!started) {
-            ESP_LOGE(WIFI_TAG, "convai_start failed after 3 attempts — no session");
-            orb_ui_set_state(ORB_CONFIG);  // leave a non-LOADING state; NFC re-scan retries
+            ESP_LOGE(WIFI_TAG, "convai_start attempt %d/3 failed; retrying", attempt);
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-    } else {
-        ESP_LOGE(WIFI_TAG, "config fetch failed");
-        // Stay in ORB_CONFIG so the screen reflects that we got the network
-        // but never resolved an agent. Manual NFC scan will retry config
-        // fetch + convai_start.
+    }
+    if (!started) {
+        ESP_LOGE(WIFI_TAG, "convai_start failed after 3 attempts — no session");
+        orb_ui_set_state(ORB_CONFIG);  // leave a non-LOADING state; NFC re-scan retries
     }
     vTaskDelete(NULL);
 }
@@ -194,11 +256,18 @@ static void wifi_manager_task(void *arg)
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        s_connecting_since_us = esp_timer_get_time();   // start the fail grace timer
         orb_ui_set_state(ORB_WIFI);
         xTaskNotifyGive(s_wifi_mgr);            // scan+connect runs on wifi_mgr task
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         WiFi_Connected = false;
-        orb_ui_set_state(ORB_WIFI);
+        // Still not associated. Show "Connecting WiFi" during the grace window;
+        // once we've been trying longer than WIFI_FAIL_GRACE_MS with no success,
+        // flip to ORB_WIFI_FAIL ("No WiFi / Check router") — but keep rescanning
+        // below so it recovers on its own when the router/AP comes back.
+        if (s_connecting_since_us == 0) s_connecting_since_us = esp_timer_get_time();
+        int64_t failing_ms = (esp_timer_get_time() - s_connecting_since_us) / 1000;
+        orb_ui_set_state(failing_ms >= WIFI_FAIL_GRACE_MS ? ORB_WIFI_FAIL : ORB_WIFI);
         wifi_event_sta_disconnected_t *ev = (wifi_event_sta_disconnected_t *)data;
         uint8_t reason = ev ? ev->reason : 0;
         // reason codes: 201=NO_AP_FOUND (out of range / wrong SSID / 5GHz-only),
@@ -222,6 +291,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         ESP_LOGI(WIFI_TAG, "got IP " IPSTR, IP2STR(&ev->ip_info.ip));
         WiFi_Connected = true;
+        s_connecting_since_us = 0;   // connected — clear the fail grace timer
         // CONFIG state is set inside post_connect_task, AFTER the WIFI→
         // CONFIG transition beep. UI stays on ORB_WIFI until then.
         // 8 KB stack: post_connect_task now does TWO back-to-back TLS handshakes
